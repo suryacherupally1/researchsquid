@@ -23,6 +23,7 @@ async def save_persona(driver: "DAGClient", persona: AgentPersona) -> str:
             p.source_strictness = $source_strictness,
             p.experiment_appetite = $experiment_appetite,
             p.reporting_style = $reporting_style,
+            p.model_tier = $model_tier,
             p.created_at = $created_at,
             p.updated_at = $updated_at,
             p.revision_history = $revision_history
@@ -38,6 +39,7 @@ async def save_persona(driver: "DAGClient", persona: AgentPersona) -> str:
         source_strictness=persona.source_strictness,
         experiment_appetite=persona.experiment_appetite,
         reporting_style=persona.reporting_style,
+        model_tier=persona.model_tier,
         created_at=(persona.created_at or datetime.utcnow()).isoformat(),
         updated_at=(persona.updated_at or datetime.utcnow()).isoformat(),
         revision_history=str(persona.revision_history),
@@ -90,6 +92,7 @@ async def load_persona(
         source_strictness=props.get("source_strictness", 0.7),
         experiment_appetite=props.get("experiment_appetite", 0.5),
         reporting_style=props.get("reporting_style", "concise"),
+        model_tier=props.get("model_tier", "fast"),
         created_at=props.get("created_at"),
         updated_at=props.get("updated_at"),
         revision_history=_parse_revision_history(props.get("revision_history", "[]")),

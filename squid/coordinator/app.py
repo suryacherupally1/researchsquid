@@ -371,6 +371,7 @@ def create_app() -> FastAPI:
         source_strictness: Optional[float] = None,
         experiment_appetite: Optional[float] = None,
         reporting_style: Optional[str] = None,
+        model_tier: Optional[str] = None,
     ):
         """Set or update agent persona. Only strategy fields are editable."""
         # Load existing from Neo4j
@@ -408,6 +409,9 @@ def create_app() -> FastAPI:
             if reporting_style is not None:
                 revision_entry["changes"]["reporting_style"] = (persona.reporting_style, reporting_style)
                 persona.reporting_style = reporting_style
+            if model_tier is not None:
+                revision_entry["changes"]["model_tier"] = (persona.model_tier, model_tier)
+                persona.model_tier = model_tier
 
             persona.revision_history.append(revision_entry)
         else:
@@ -427,6 +431,8 @@ def create_app() -> FastAPI:
                 persona.experiment_appetite = experiment_appetite
             if reporting_style is not None:
                 persona.reporting_style = reporting_style
+            if model_tier is not None:
+                persona.model_tier = model_tier
 
         # Persist to Neo4j
         await save_persona(dag_client, persona)

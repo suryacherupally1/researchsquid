@@ -56,6 +56,14 @@
             <option value="detailed">Detailed</option>
             <option value="critical">Critical</option>
           </select>
+          <div class="model-tier-select">
+            <label>Model Tier</label>
+            <select v-model="editModelTier">
+              <option value="fast">⚡ Fast (cheapest — Haiku, GPT-4o-mini)</option>
+              <option value="balanced">⚖️ Balanced (mid — Sonnet, GPT-4o)</option>
+              <option value="powerful">🧠 Powerful (best — Opus, o1)</option>
+            </select>
+          </div>
           <button @click="savePersona" class="save-btn">Save Persona</button>
         </div>
       </div>
@@ -114,6 +122,7 @@ const editSkepticism = ref(50)
 const editSourceStrict = ref(70)
 const editExperiment = ref(50)
 const editReporting = ref('concise')
+const editModelTier = ref('fast')
 
 onMounted(async () => {
   try { templates.value = (await api.getTemplates()).templates } catch {}
@@ -129,6 +138,7 @@ async function inspect() {
       editSourceStrict.value = Math.round(data.value.persona.source_strictness * 100)
       editExperiment.value = Math.round(data.value.persona.experiment_appetite * 100)
       editReporting.value = data.value.persona.reporting_style
+      editModelTier.value = data.value.persona.model_tier || 'fast'
     }
   } catch (e) { alert(e.message) }
   finally { loading.value = false }
@@ -142,6 +152,7 @@ async function savePersona() {
       source_strictness: editSourceStrict.value / 100,
       experiment_appetite: editExperiment.value / 100,
       reporting_style: editReporting.value,
+      model_tier: editModelTier.value,
     })
     data.value.persona = result.persona
     alert(`Persona saved (revision ${result.persona.revision})`)
@@ -191,6 +202,9 @@ button:hover { background: #f5f5f5; }
 .slider-row input[type=range] { flex: 1; }
 .slider-row span { width: 35px; text-align: right; font-family: monospace; }
 .save-btn { width: 100%; margin-top: 8px; background: #111; color: #fff; border: none; }
+.model-tier-select { margin: 8px 0; }
+.model-tier-select label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #666; margin-bottom: 4px; }
+.model-tier-select select { width: 100%; padding: 6px; font-size: 11px; border: 1px solid #ccc; }
 .finding-card, .exp-card { display: flex; gap: 6px; align-items: center; padding: 3px 0; font-size: 11px; }
 .conf-badge { font-family: monospace; font-size: 10px; padding: 1px 4px; }
 .conf-badge.high { background: #e8f5e9; color: #2e7d32; }
