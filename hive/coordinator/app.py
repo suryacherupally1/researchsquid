@@ -1,4 +1,8 @@
-"""HiveResearch Coordinator — FastAPI application factory."""
+"""HiveResearch Coordinator — FastAPI application factory.
+
+Extended with: SSE telemetry, agent inspector, persona management,
+interview system, audit logging, session workflow state.
+"""
 
 import os
 import uuid
@@ -6,7 +10,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from hive.schema.finding import Finding
@@ -16,6 +21,9 @@ from hive.dag.client import DAGClient
 from hive.dag.writer import post_finding, write_experiment_spec, post_experiment_result
 from hive.dag.reader import get_context, get_frontier, get_paradigm_shifts, get_session_summary
 from hive.dag.taxonomy import classify_source_tier
+from hive.coordinator.audit import get_audit_logger, EventType
+from hive.coordinator.telemetry import get_telemetry
+from hive.agents.persona import AgentPersona, create_persona, generate_persona_prompt, PERSONA_TEMPLATES
 
 
 def gen_id(prefix: str) -> str:
@@ -23,6 +31,9 @@ def gen_id(prefix: str) -> str:
 
 
 dag_client: Optional[DAGClient] = None
+
+# In-memory persona store (production: persist to Neo4j/Postgres)
+_persona_store: Dict[str, AgentPersona] = {}
 
 
 @asynccontextmanager
@@ -40,22 +51,26 @@ async def lifespan(app: FastAPI):
                 try:
                     await dag_client.run(stmt)
                 except Exception:
-                    pass  # Constraints may already exist
+                    pass
 
     yield
     await dag_client.close()
 
 
 def create_app() -> FastAPI:
-    """Create FastAPI application."""
     app = FastAPI(
         title="HiveResearch Coordinator",
         description="Two-tier autonomous research system",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
-    # --- Session Endpoints ---
+    audit = get_audit_logger()
+    telemetry = get_telemetry()
+
+    # ================================================================
+    # SESSION ENDPOINTS
+    # ================================================================
 
     @app.post("/research", response_model=Session)
     async def start_research(config: SessionConfig):
@@ -81,6 +96,14 @@ def create_app() -> FastAPI:
             llm_budget_usd=session.llm_budget_usd,
             compute_budget_usd=session.compute_budget_usd,
         )
+        audit.log(session.id, EventType.SESSION_STARTED, {
+            "question": config.question,
+            "modality": config.modality,
+            "agent_count": config.agent_count,
+        })
+        await telemetry.publish(session.id, "session_started", {
+            "question": config.question, "modality": config.modality,
+        })
         return session
 
     @app.get("/session/{session_id}")
@@ -93,16 +116,22 @@ def create_app() -> FastAPI:
     @app.post("/session/{session_id}/stop")
     async def stop_session(session_id: str):
         await dag_client.run("MATCH (s:Session {id: $id}) SET s.status = 'stopped'", id=session_id)
+        audit.log(session_id, EventType.SESSION_COMPLETED, {"status": "stopped"})
+        await telemetry.publish(session_id, "session_completed", {"status": "stopped"})
         return {"session_id": session_id, "status": "stopped"}
 
     @app.post("/session/{session_id}/pause")
     async def pause_session(session_id: str):
         await dag_client.run("MATCH (s:Session {id: $id}) SET s.status = 'paused'", id=session_id)
+        audit.log(session_id, EventType.SESSION_PAUSED, {})
+        await telemetry.publish(session_id, "session_paused", {})
         return {"session_id": session_id, "status": "paused"}
 
     @app.post("/session/{session_id}/resume")
     async def resume_session(session_id: str):
         await dag_client.run("MATCH (s:Session {id: $id}) SET s.status = 'active'", id=session_id)
+        audit.log(session_id, EventType.SESSION_RESUMED, {})
+        await telemetry.publish(session_id, "session_resumed", {})
         return {"session_id": session_id, "status": "active"}
 
     @app.get("/session/{session_id}/summary")
@@ -124,7 +153,404 @@ def create_app() -> FastAPI:
             "edges": [{"src": r["src"], "type": r["type"], "tgt": r["tgt"], "props": dict(r["props"])} for r in edges],
         }
 
-    # --- Internal Endpoints (Tier-1 agents) ---
+    # ================================================================
+    # SESSION STATUS (rich — agents, experiments, budget, workflow step)
+    # ================================================================
+
+    @app.get("/session/{session_id}/status")
+    async def session_status(session_id: str):
+        """Rich session status for UI workflow display."""
+        # Agents
+        agent_records = await dag_client.run(
+            "MATCH (a:Agent {session_id: $sid}) RETURN a", sid=session_id
+        )
+        agents = [dict(r["a"]) for r in agent_records]
+
+        # Findings
+        finding_records = await dag_client.run(
+            "MATCH (f:Finding {session_id: $sid}) RETURN f", sid=session_id
+        )
+        findings = [dict(r["f"]) for r in finding_records]
+
+        # Experiments
+        exp_records = await dag_client.run(
+            "MATCH (e:Experiment {session_id: $sid}) RETURN e", sid=session_id
+        )
+        experiments = [dict(r["e"]) for r in exp_records]
+
+        # Run records
+        run_records = await dag_client.run(
+            "MATCH (r:ExperimentRun {session_id: $sid}) RETURN r", sid=session_id
+        )
+        runs = [dict(r["r"]) for r in run_records]
+
+        # Session
+        session_records = await dag_client.run(
+            "MATCH (s:Session {id: $id}) RETURN s", id=session_id
+        )
+        session_data = dict(session_records[0]["s"]) if session_records else {}
+
+        # Contradictions
+        contradictions = [
+            f for f in findings
+            if f.get("relation_type") == "CONTRADICTS" and f.get("status") == "active"
+        ]
+
+        # Determine workflow step
+        workflow_step = _determine_workflow_step(findings, experiments, runs, session_data)
+
+        return {
+            "session_id": session_id,
+            "workflow_step": workflow_step,
+            "question": session_data.get("question", ""),
+            "status": session_data.get("status", "unknown"),
+            "agents": {
+                "total": len(agents),
+                "active": len([a for a in agents if a.get("status") == "researching"]),
+                "sleeping": len([a for a in agents if a.get("status") == "sleeping"]),
+            },
+            "findings": {
+                "total": len(findings),
+                "active": len([f for f in findings if f.get("status") == "active"]),
+                "with_verification": len([f for f in findings if f.get("has_numerical_verification")]),
+            },
+            "experiments": {
+                "total": len(experiments),
+                "pending": len([e for e in experiments if e.get("status") == "pending"]),
+                "running": len([e for e in experiments if e.get("status") == "running"]),
+                "completed": len([e for e in experiments if e.get("status") == "completed"]),
+                "failed": len([e for e in experiments if e.get("status") == "failed"]),
+            },
+            "runs": {
+                "total": len(runs),
+                "passed": len([r for r in runs if r.get("passed_constraints")]),
+            },
+            "contradictions": len(contradictions),
+            "budget": {
+                "llm_spent": session_data.get("llm_spent_usd", 0),
+                "llm_budget": session_data.get("llm_budget_usd", 0),
+                "compute_spent": session_data.get("compute_spent_usd", 0),
+                "compute_budget": session_data.get("compute_budget_usd", 0),
+            },
+            "best_answer": _get_best_answer_label(findings),
+        }
+
+    def _determine_workflow_step(findings, experiments, runs, session_data):
+        if session_data.get("status") in ("stopped", "completed"):
+            return 6  # Report
+        if runs:
+            return 5  # Clusters/Debates
+        if experiments:
+            return 4  # Experiment Queue
+        if findings:
+            return 3  # Agent Search
+        if session_data.get("status") == "active":
+            return 1  # Question/Goal
+        return 0
+
+    def _get_best_answer_label(findings):
+        active = [f for f in findings if f.get("status") == "active"]
+        if not active:
+            return {"label": "Insufficient evidence", "confidence": 0}
+        best = max(active, key=lambda f: f.get("confidence", 0))
+        conf = best.get("confidence", 0)
+        if conf >= 0.85:
+            label = "High confidence"
+        elif conf >= 0.65:
+            label = "Moderately confident"
+        elif conf >= 0.45:
+            label = "Tentative"
+        elif conf >= 0.25:
+            label = "Weak evidence"
+        else:
+            label = "Insufficient evidence"
+        return {"label": label, "confidence": conf, "claim": best.get("claim", "")}
+
+    # ================================================================
+    # SSE TELEMETRY STREAM
+    # ================================================================
+
+    @app.get("/session/{session_id}/stream")
+    async def session_stream(session_id: str):
+        """SSE stream of session events."""
+        return StreamingResponse(
+            telemetry.sse_stream(session_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # ================================================================
+    # AGENT INSPECTOR
+    # ================================================================
+
+    @app.get("/session/{session_id}/agent/{agent_id}")
+    async def inspect_agent(session_id: str, agent_id: str):
+        """Inspect one agent's full state."""
+        # Agent node
+        agent_records = await dag_client.run(
+            "MATCH (a:Agent {id: $aid, session_id: $sid}) RETURN a",
+            aid=agent_id, sid=session_id,
+        )
+        agent_data = dict(agent_records[0]["a"]) if agent_records else {"id": agent_id}
+
+        # Agent's findings
+        finding_records = await dag_client.run(
+            "MATCH (f:Finding {agent_id: $aid, session_id: $sid}) RETURN f ORDER BY f.created_at DESC LIMIT 20",
+            aid=agent_id, sid=session_id,
+        )
+        findings = [dict(r["f"]) for r in finding_records]
+
+        # Agent's experiments
+        exp_records = await dag_client.run(
+            "MATCH (e:Experiment {submitted_by: $aid, session_id: $sid}) RETURN e ORDER BY e.submitted_at DESC LIMIT 10",
+            aid=agent_id, sid=session_id,
+        )
+        experiments = [dict(r["e"]) for r in exp_records]
+
+        # Persona
+        persona = _persona_store.get(f"{session_id}:{agent_id}")
+
+        # Cluster membership
+        cluster_records = await dag_client.run(
+            "MATCH (c:Cluster)<-[:BELONGS_TO]-(f:Finding {agent_id: $aid, session_id: $sid}) RETURN DISTINCT c",
+            aid=agent_id, sid=session_id,
+        )
+        clusters = [dict(r["c"]) for r in cluster_records]
+
+        return {
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "agent_data": agent_data,
+            "persona": persona.model_dump() if persona else None,
+            "findings_count": len(findings),
+            "findings_recent": findings[:5],
+            "experiments_count": len(experiments),
+            "experiments_recent": experiments[:5],
+            "clusters": clusters,
+            "current_hypothesis": _extract_current_hypothesis(findings),
+        }
+
+    def _extract_current_hypothesis(findings):
+        """Extract the agent's current primary hypothesis from their findings."""
+        active = [f for f in findings if f.get("status") == "active"]
+        if not active:
+            return None
+        best = max(active, key=lambda f: f.get("confidence", 0))
+        return {
+            "claim": best.get("claim"),
+            "confidence": best.get("confidence"),
+            "evidence_type": best.get("evidence_type"),
+        }
+
+    # ================================================================
+    # PERSONA MANAGEMENT
+    # ================================================================
+
+    @app.get("/personas/templates")
+    async def list_persona_templates():
+        """List available persona templates."""
+        return {
+            "templates": {
+                name: {k: v for k, v in data.items()}
+                for name, data in PERSONA_TEMPLATES.items()
+            }
+        }
+
+    @app.post("/session/{session_id}/agent/{agent_id}/persona")
+    async def set_agent_persona(
+        session_id: str,
+        agent_id: str,
+        template: Optional[str] = None,
+        specialty: Optional[str] = None,
+        skepticism_level: Optional[float] = None,
+        preferred_evidence_types: Optional[List[str]] = None,
+        contradiction_aggressiveness: Optional[float] = None,
+        source_strictness: Optional[float] = None,
+        experiment_appetite: Optional[float] = None,
+        reporting_style: Optional[str] = None,
+    ):
+        """Set or update agent persona. Only strategy fields are editable."""
+        key = f"{session_id}:{agent_id}"
+        existing = _persona_store.get(key)
+
+        if existing:
+            # Revision: update editable fields, keep revision history
+            old = existing.model_dump()
+            revision_entry = {
+                "revision": existing.revision,
+                "timestamp": datetime.utcnow().isoformat(),
+                "changes": {},
+            }
+            persona = existing
+            persona.revision += 1
+            persona.updated_at = datetime.utcnow()
+
+            if specialty is not None:
+                revision_entry["changes"]["specialty"] = (persona.specialty, specialty)
+                persona.specialty = specialty
+            if skepticism_level is not None:
+                revision_entry["changes"]["skepticism_level"] = (persona.skepticism_level, skepticism_level)
+                persona.skepticism_level = skepticism_level
+            if preferred_evidence_types is not None:
+                revision_entry["changes"]["preferred_evidence_types"] = (persona.preferred_evidence_types, preferred_evidence_types)
+                persona.preferred_evidence_types = preferred_evidence_types
+            if contradiction_aggressiveness is not None:
+                revision_entry["changes"]["contradiction_aggressiveness"] = (persona.contradiction_aggressiveness, contradiction_aggressiveness)
+                persona.contradiction_aggressiveness = contradiction_aggressiveness
+            if source_strictness is not None:
+                revision_entry["changes"]["source_strictness"] = (persona.source_strictness, source_strictness)
+                persona.source_strictness = source_strictness
+            if experiment_appetite is not None:
+                revision_entry["changes"]["experiment_appetite"] = (persona.experiment_appetite, experiment_appetite)
+                persona.experiment_appetite = experiment_appetite
+            if reporting_style is not None:
+                revision_entry["changes"]["reporting_style"] = (persona.reporting_style, reporting_style)
+                persona.reporting_style = reporting_style
+
+            persona.revision_history.append(revision_entry)
+        else:
+            # New persona
+            persona = create_persona(agent_id, session_id, template=template)
+            if specialty is not None:
+                persona.specialty = specialty
+            if skepticism_level is not None:
+                persona.skepticism_level = skepticism_level
+            if preferred_evidence_types is not None:
+                persona.preferred_evidence_types = preferred_evidence_types
+            if contradiction_aggressiveness is not None:
+                persona.contradiction_aggressiveness = contradiction_aggressiveness
+            if source_strictness is not None:
+                persona.source_strictness = source_strictness
+            if experiment_appetite is not None:
+                persona.experiment_appetite = experiment_appetite
+            if reporting_style is not None:
+                persona.reporting_style = reporting_style
+
+        _persona_store[key] = persona
+
+        audit.log(session_id, EventType.PERSONA_REVISION_APPLIED, {
+            "agent_id": agent_id,
+            "revision": persona.revision,
+            "persona_id": persona.id,
+        }, agent_id=agent_id)
+        await telemetry.publish(session_id, "persona_revision_applied", {
+            "agent_id": agent_id, "revision": persona.revision,
+        }, agent_id=agent_id)
+
+        return {"persona": persona.model_dump(), "prompt_addition": generate_persona_prompt(persona)}
+
+    @app.get("/session/{session_id}/agent/{agent_id}/persona")
+    async def get_agent_persona(session_id: str, agent_id: str):
+        """Get agent's current persona."""
+        key = f"{session_id}:{agent_id}"
+        persona = _persona_store.get(key)
+        if not persona:
+            return {"persona": None, "prompt_addition": None}
+        return {"persona": persona.model_dump(), "prompt_addition": generate_persona_prompt(persona)}
+
+    # ================================================================
+    # AGENT INTERVIEW
+    # ================================================================
+
+    class InterviewRequest(BaseModel):
+        agent_id: str
+        prompt: str
+        max_context_findings: int = 10
+
+    class BatchInterviewRequest(BaseModel):
+        interviews: List[InterviewRequest]
+        shared_prompt: Optional[str] = None
+
+    @app.post("/session/{session_id}/interview")
+    async def interview_agent(session_id: str, req: InterviewRequest):
+        """Interview a single agent — read-only, grounded in their history."""
+        audit.log(session_id, EventType.INTERVIEW_STARTED, {
+            "agent_id": req.agent_id, "prompt": req.prompt,
+        }, agent_id=req.agent_id)
+
+        # Gather agent context
+        finding_records = await dag_client.run(
+            "MATCH (f:Finding {agent_id: $aid, session_id: $sid}) RETURN f ORDER BY f.confidence DESC LIMIT $limit",
+            aid=req.agent_id, sid=session_id, limit=req.max_context_findings,
+        )
+        findings = [dict(r["f"]) for r in finding_records]
+
+        exp_records = await dag_client.run(
+            "MATCH (e:Experiment {submitted_by: $aid, session_id: $sid}) RETURN e ORDER BY e.submitted_at DESC LIMIT 5",
+            aid=req.agent_id, sid=session_id,
+        )
+        experiments = [dict(r["e"]) for r in exp_records]
+
+        persona = _persona_store.get(f"{session_id}:{req.agent_id}")
+
+        # Build grounded context
+        context = {
+            "agent_id": req.agent_id,
+            "findings": findings,
+            "experiments": experiments,
+            "persona": persona.model_dump() if persona else None,
+            "prompt": req.prompt,
+        }
+
+        # In production, this would call LLM with the agent's context
+        # For now, return structured context for the interviewer
+        response = {
+            "agent_id": req.agent_id,
+            "prompt": req.prompt,
+            "context_summary": {
+                "findings_count": len(findings),
+                "experiments_count": len(experiments),
+                "current_hypothesis": _extract_current_hypothesis(findings),
+                "persona_specialty": persona.specialty if persona else "general",
+            },
+            "grounded_response": "Interview requires LLM integration. Context is provided for external processing.",
+            "context": context,
+        }
+
+        audit.log(session_id, EventType.INTERVIEW_COMPLETED, {
+            "agent_id": req.agent_id,
+            "findings_used": len(findings),
+        }, agent_id=req.agent_id)
+
+        return response
+
+    @app.post("/session/{session_id}/interview/batch")
+    async def interview_batch(session_id: str, req: BatchInterviewRequest):
+        """Interview multiple agents."""
+        results = {}
+        for interview in req.interviews:
+            prompt = req.shared_prompt or interview.prompt
+            single_req = InterviewRequest(
+                agent_id=interview.agent_id,
+                prompt=prompt,
+                max_context_findings=interview.max_context_findings,
+            )
+            result = await interview_agent(session_id, single_req)
+            results[interview.agent_id] = result
+        return {"interviews": results, "count": len(results)}
+
+    @app.post("/session/{session_id}/interview/all")
+    async def interview_all(session_id: str, prompt: str, max_agents: int = 25):
+        """Interview all agents with the same question."""
+        agent_records = await dag_client.run(
+            "MATCH (a:Agent {session_id: $sid}) RETURN a.id as agent_id LIMIT $limit",
+            sid=session_id, limit=max_agents,
+        )
+        agent_ids = [r["agent_id"] for r in agent_records]
+
+        req = BatchInterviewRequest(
+            interviews=[InterviewRequest(agent_id=aid, prompt=prompt) for aid in agent_ids],
+            shared_prompt=prompt,
+        )
+        return await interview_batch(session_id, req)
+
+    # ================================================================
+    # INTERNAL ENDPOINTS (Tier-1 agents)
+    # ================================================================
 
     class FindingRequest(BaseModel):
         claim: str
@@ -161,6 +587,23 @@ def create_app() -> FastAPI:
             counter_claim=req.counter_claim,
         )
         fid = await post_finding(dag_client, finding)
+
+        audit.log(req.session_id, EventType.FINDING_POSTED, {
+            "finding_id": fid, "claim": req.claim, "confidence": req.confidence,
+        }, agent_id=req.agent_id)
+        await telemetry.publish(req.session_id, "finding_posted", {
+            "finding_id": fid, "claim": req.claim, "confidence": req.confidence,
+            "agent_id": req.agent_id,
+        }, agent_id=req.agent_id)
+
+        if req.relation_type == "CONTRADICTS":
+            audit.log(req.session_id, EventType.CONTRADICTION_OPENED, {
+                "finding_id": fid, "target": req.relates_to, "counter_claim": req.counter_claim,
+            }, agent_id=req.agent_id)
+            await telemetry.publish(req.session_id, "contradiction_opened", {
+                "finding_id": fid, "counter_claim": req.counter_claim,
+            }, agent_id=req.agent_id)
+
         return {"finding_id": fid, "status": "created"}
 
     @app.post("/internal/experiment")
@@ -170,13 +613,23 @@ def create_app() -> FastAPI:
         spec.submitted_by = agent_id
         spec.submitted_at = datetime.utcnow()
         sid = await write_experiment_spec(dag_client, spec)
+
+        audit.log(session_id, EventType.EXPERIMENT_SUBMITTED, {
+            "spec_id": sid, "executor_type": spec.backend_type,
+        }, agent_id=agent_id)
+        await telemetry.publish(session_id, "experiment_submitted", {
+            "spec_id": sid, "executor_type": spec.backend_type, "agent_id": agent_id,
+        }, agent_id=agent_id)
+
         return {"spec_id": sid, "status": "queued"}
 
     @app.get("/internal/context/{agent_id}")
     async def agent_context(agent_id: str, session_id: str):
         return await get_context(dag_client, session_id, agent_id)
 
-    # --- Backend-facing ---
+    # ================================================================
+    # BACKEND-FACING
+    # ================================================================
 
     @app.get("/internal/experiments/queue")
     async def experiment_queue(session_id: Optional[str] = None):
@@ -194,13 +647,83 @@ def create_app() -> FastAPI:
     async def post_result(spec_id: str, result: ExperimentResult):
         result.spec_id = spec_id
         rid = await post_experiment_result(dag_client, result)
+
+        status_event = EventType.EXPERIMENT_COMPLETED if result.status == "completed" else EventType.EXPERIMENT_FAILED
+        audit.log(result.session_id, status_event, {
+            "run_id": rid, "spec_id": spec_id, "status": result.status.value,
+        })
+        await telemetry.publish(result.session_id, f"experiment_{result.status.value}", {
+            "run_id": rid, "spec_id": spec_id,
+        })
+
         return {"run_id": rid, "status": result.status}
 
-    # --- Health ---
+    # ================================================================
+    # REPORT GENERATION
+    # ================================================================
+
+    @app.post("/session/{session_id}/report/plan")
+    async def plan_report(session_id: str):
+        """Plan report outline using ReportAgent."""
+        from hive.coordinator.report_agent import ReportAgent
+        agent = ReportAgent(dag_client, session_id)
+        session_records = await dag_client.run("MATCH (s:Session {id: $id}) RETURN s", id=session_id)
+        question = session_records[0]["s"]["question"] if session_records else ""
+        outline = await agent.plan_outline(question)
+        return {"outline": outline, "audit_log": agent.audit_log}
+
+    @app.get("/session/{session_id}/report")
+    async def generate_report(session_id: str):
+        """Generate full report using tool-using ReportAgent."""
+        from hive.coordinator.report_agent import ReportAgent
+        agent = ReportAgent(dag_client, session_id)
+
+        session_records = await dag_client.run("MATCH (s:Session {id: $id}) RETURN s", id=session_id)
+        question = session_records[0]["s"]["question"] if session_records else ""
+
+        outline = await agent.plan_outline(question)
+        findings = await get_frontier(dag_client, session_id)
+
+        sections = []
+        for section in outline:
+            audit.log(session_id, EventType.REPORT_PROGRESS, {
+                "section": section["title"], "status": "generating",
+            })
+            await telemetry.publish(session_id, "report_progress", {
+                "section": section["title"], "status": "generating",
+            })
+
+            content = await agent.generate_section(section, findings)
+            sections.append({"title": section["title"], "content": content})
+
+        report = "\n\n".join(s["content"] for s in sections)
+
+        audit.log(session_id, EventType.REPORT_PROGRESS, {"status": "complete"})
+        await telemetry.publish(session_id, "report_progress", {"status": "complete"})
+
+        return {
+            "report": report,
+            "sections": sections,
+            "audit_log": agent.audit_log,
+        }
+
+    # ================================================================
+    # AUDIT LOG
+    # ================================================================
+
+    @app.get("/session/{session_id}/audit")
+    async def get_audit_log(session_id: str, limit: int = 100, offset: int = 0):
+        """Read session audit log."""
+        events = audit.read_log(session_id, limit=limit, offset=offset)
+        return {"events": events, "count": len(events)}
+
+    # ================================================================
+    # HEALTH
+    # ================================================================
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "service": "hive-research-coordinator"}
+        return {"status": "ok", "service": "hive-research-coordinator", "version": "0.2.0"}
 
     return app
 

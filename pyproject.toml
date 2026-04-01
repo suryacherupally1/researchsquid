@@ -4,11 +4,12 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "hive-research"
-version = "0.1.0"
+version = "0.2.0"
 description = "Two-tier autonomous research system — Tier 1 proposes, Tier 2 validates, DAG remembers"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
+    "sse-starlette>=2.0",
     "pydantic>=2.0",
     "neo4j>=5.0",
     "psycopg2-binary",
