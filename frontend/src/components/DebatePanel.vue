@@ -16,7 +16,7 @@
 
 <script setup>
 defineProps({ contradictions: { type: Number, default: 0 } })
-</style>
+</script>
 
 <style scoped>
 .debate-panel { margin: 24px 0; }

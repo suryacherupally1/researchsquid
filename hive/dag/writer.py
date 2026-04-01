@@ -1,14 +1,15 @@
 """DAG write operations — write_finding(), write_experiment_result(), write_edge()."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from hive.dag.client import DAGClient
+if TYPE_CHECKING:
+    from hive.dag.client import DAGClient
 from hive.schema.finding import Finding
 from hive.schema.experiment import ExperimentResult, ExperimentSpec
 
 
-async def post_finding(driver: DAGClient, finding: Finding) -> str:
+async def post_finding(driver: "DAGClient", finding: Finding) -> str:
     """
     Write a Finding to the DAG.
 
@@ -102,7 +103,7 @@ async def post_finding(driver: DAGClient, finding: Finding) -> str:
     return finding.id
 
 
-async def write_experiment_spec(driver: DAGClient, spec: ExperimentSpec) -> str:
+async def write_experiment_spec(driver: "DAGClient", spec: ExperimentSpec) -> str:
     """Write an Experiment node to the DAG."""
     await driver.run(
         """
@@ -129,7 +130,7 @@ async def write_experiment_spec(driver: DAGClient, spec: ExperimentSpec) -> str:
     return spec.id
 
 
-async def post_experiment_result(driver: DAGClient, result: ExperimentResult) -> str:
+async def post_experiment_result(driver: "DAGClient", result: ExperimentResult) -> str:
     """
     Write ExperimentRun node and create DAG edges.
 
@@ -190,7 +191,7 @@ async def post_experiment_result(driver: DAGClient, result: ExperimentResult) ->
 
 
 async def write_edge(
-    driver: DAGClient,
+    driver: "DAGClient",
     source_id: str,
     target_id: str,
     edge_type: str,

@@ -1,19 +1,9 @@
-from hive.coordinator.session import create_session, pause_session, resume_session, stop_session
-from hive.coordinator.app import create_app
-from hive.coordinator.audit import AuditLogger, EventType, get_audit_logger
-from hive.coordinator.telemetry import SessionTelemetry, get_telemetry
-from hive.coordinator.report_agent import ReportAgent
+"""HiveResearch coordinator — session lifecycle, routing, budget, telemetry."""
 
-__all__ = [
-    "create_session",
-    "pause_session",
-    "resume_session",
-    "stop_session",
-    "create_app",
-    "AuditLogger",
-    "EventType",
-    "get_audit_logger",
-    "SessionTelemetry",
-    "get_telemetry",
-    "ReportAgent",
-]
+# Lazy imports to avoid dependency chain issues at import time.
+# These are available via direct import:
+#   from hive.coordinator.session import create_session
+#   from hive.coordinator.app import create_app
+#   from hive.coordinator.audit import AuditLogger, EventType
+#   from hive.coordinator.telemetry import SessionTelemetry
+#   from hive.coordinator.report_agent import ReportAgent

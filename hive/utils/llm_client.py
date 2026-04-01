@@ -92,5 +92,16 @@ _llm_client: Optional[LLMClient] = None
 def get_llm_client() -> LLMClient:
     global _llm_client
     if _llm_client is None:
-        _llm_client = LLMClient()
+        # Support mock mode for testing
+        if os.getenv("HIVE_MOCK_LLM", "").lower() in ("true", "1", "yes"):
+            from hive.utils.mock_llm import MockLLMClient
+            _llm_client = MockLLMClient()  # type: ignore
+        else:
+            _llm_client = LLMClient()
     return _llm_client
+
+
+def set_llm_client(client):
+    """Override the LLM client (for testing)."""
+    global _llm_client
+    _llm_client = client

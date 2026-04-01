@@ -1,13 +1,14 @@
 """Persona persistence — Neo4j storage for agent personas and revision history."""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from hive.dag.client import DAGClient
+if TYPE_CHECKING:
+    from hive.dag.client import DAGClient
 from hive.agents.persona import AgentPersona
 
 
-async def save_persona(driver: DAGClient, persona: AgentPersona) -> str:
+async def save_persona(driver: "DAGClient", persona: AgentPersona) -> str:
     """Persist persona to Neo4j."""
     await driver.run(
         """
@@ -62,7 +63,7 @@ async def save_persona(driver: DAGClient, persona: AgentPersona) -> str:
 
 
 async def load_persona(
-    driver: DAGClient, session_id: str, agent_id: str
+    driver: "DAGClient", session_id: str, agent_id: str
 ) -> Optional[AgentPersona]:
     """Load persona from Neo4j."""
     records = await driver.run(
@@ -96,7 +97,7 @@ async def load_persona(
 
 
 async def load_session_personas(
-    driver: DAGClient, session_id: str
+    driver: "DAGClient", session_id: str
 ) -> List[AgentPersona]:
     """Load all personas for a session."""
     records = await driver.run(

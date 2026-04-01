@@ -12,3 +12,5 @@ venv/
 neo4j_data/
 postgres_data/
 *.log
+node_modules/
+frontend/dist/

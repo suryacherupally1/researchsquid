@@ -1,13 +1,13 @@
 """DAG read operations — get_context(), get_frontier(), get_clusters()."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from hive.dag.client import DAGClient
-from hive.schema.finding import Finding
+if TYPE_CHECKING:
+    from hive.dag.client import DAGClient
 
 
 async def get_context(
-    driver: DAGClient,
+    driver: "DAGClient",
     session_id: str,
     agent_id: str,
 ) -> Dict[str, Any]:
@@ -29,7 +29,7 @@ async def get_context(
     }
 
 
-async def get_frontier(driver: DAGClient, session_id: str) -> List[Dict]:
+async def get_frontier(driver: "DAGClient", session_id: str) -> List[Dict]:
     """Get active, non-superseded findings — the research frontier."""
     records = await driver.run(
         """
@@ -43,7 +43,7 @@ async def get_frontier(driver: DAGClient, session_id: str) -> List[Dict]:
     return [dict(record["f"]) for record in records]
 
 
-async def get_pending_experiments(driver: DAGClient, session_id: str) -> List[Dict]:
+async def get_pending_experiments(driver: "DAGClient", session_id: str) -> List[Dict]:
     """Get pending ExperimentSpecs for a session."""
     records = await driver.run(
         """
@@ -56,7 +56,7 @@ async def get_pending_experiments(driver: DAGClient, session_id: str) -> List[Di
     return [dict(record["e"]) for record in records]
 
 
-async def get_clusters(driver: DAGClient, session_id: str) -> List[Dict]:
+async def get_clusters(driver: "DAGClient", session_id: str) -> List[Dict]:
     """Get clusters for a session."""
     records = await driver.run(
         """
@@ -70,7 +70,7 @@ async def get_clusters(driver: DAGClient, session_id: str) -> List[Dict]:
     return [dict(record["c"]) for record in records]
 
 
-async def get_paradigm_shifts(driver: DAGClient) -> List[Dict]:
+async def get_paradigm_shifts(driver: "DAGClient") -> List[Dict]:
     """Find challengers that outweigh their parents."""
     records = await driver.run(
         """
@@ -89,7 +89,7 @@ async def get_paradigm_shifts(driver: DAGClient) -> List[Dict]:
     return [dict(record) for record in records]
 
 
-async def get_session_summary(driver: DAGClient, session_id: str) -> str:
+async def get_session_summary(driver: "DAGClient", session_id: str) -> str:
     """Get natural-language summary of current research findings."""
     frontier = await get_frontier(driver, session_id)
     if not frontier:

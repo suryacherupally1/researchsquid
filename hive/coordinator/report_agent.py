@@ -8,7 +8,6 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from hive.dag.client import DAGClient
 from hive.dag.reader import get_frontier, get_clusters, get_paradigm_shifts
 from hive.schema.finding import Finding
 
@@ -32,7 +31,7 @@ class ReportAgent:
     5. REFLECT: Check for missing limitations, minority positions
     """
 
-    def __init__(self, dag: DAGClient, session_id: str):
+    def __init__(self, dag, session_id: str):
         self.dag = dag
         self.session_id = session_id
         self.audit_log: List[Dict[str, Any]] = []
