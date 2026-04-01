@@ -24,6 +24,8 @@ from hive.dag.taxonomy import classify_source_tier
 from hive.coordinator.audit import get_audit_logger, EventType
 from hive.coordinator.telemetry import get_telemetry
 from hive.agents.persona import AgentPersona, create_persona, generate_persona_prompt, PERSONA_TEMPLATES
+from hive.dag.persona_store import save_persona, load_persona, load_session_personas
+from hive.utils.llm_client import get_llm_client
 
 
 def gen_id(prefix: str) -> str:
@@ -31,9 +33,6 @@ def gen_id(prefix: str) -> str:
 
 
 dag_client: Optional[DAGClient] = None
-
-# In-memory persona store (production: persist to Neo4j/Postgres)
-_persona_store: Dict[str, AgentPersona] = {}
 
 
 @asynccontextmanager
@@ -311,8 +310,8 @@ def create_app() -> FastAPI:
         )
         experiments = [dict(r["e"]) for r in exp_records]
 
-        # Persona
-        persona = _persona_store.get(f"{session_id}:{agent_id}")
+        # Persona (load from Neo4j)
+        persona = await load_persona(dag_client, session_id, agent_id)
 
         # Cluster membership
         cluster_records = await dag_client.run(
@@ -374,12 +373,11 @@ def create_app() -> FastAPI:
         reporting_style: Optional[str] = None,
     ):
         """Set or update agent persona. Only strategy fields are editable."""
-        key = f"{session_id}:{agent_id}"
-        existing = _persona_store.get(key)
+        # Load existing from Neo4j
+        existing = await load_persona(dag_client, session_id, agent_id)
 
         if existing:
             # Revision: update editable fields, keep revision history
-            old = existing.model_dump()
             revision_entry = {
                 "revision": existing.revision,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -430,7 +428,8 @@ def create_app() -> FastAPI:
             if reporting_style is not None:
                 persona.reporting_style = reporting_style
 
-        _persona_store[key] = persona
+        # Persist to Neo4j
+        await save_persona(dag_client, persona)
 
         audit.log(session_id, EventType.PERSONA_REVISION_APPLIED, {
             "agent_id": agent_id,
@@ -445,9 +444,8 @@ def create_app() -> FastAPI:
 
     @app.get("/session/{session_id}/agent/{agent_id}/persona")
     async def get_agent_persona(session_id: str, agent_id: str):
-        """Get agent's current persona."""
-        key = f"{session_id}:{agent_id}"
-        persona = _persona_store.get(key)
+        """Get agent's current persona from Neo4j."""
+        persona = await load_persona(dag_client, session_id, agent_id)
         if not persona:
             return {"persona": None, "prompt_addition": None}
         return {"persona": persona.model_dump(), "prompt_addition": generate_persona_prompt(persona)}
@@ -467,7 +465,7 @@ def create_app() -> FastAPI:
 
     @app.post("/session/{session_id}/interview")
     async def interview_agent(session_id: str, req: InterviewRequest):
-        """Interview a single agent — read-only, grounded in their history."""
+        """Interview a single agent — read-only, grounded in their history. Uses LLM."""
         audit.log(session_id, EventType.INTERVIEW_STARTED, {
             "agent_id": req.agent_id, "prompt": req.prompt,
         }, agent_id=req.agent_id)
@@ -485,35 +483,79 @@ def create_app() -> FastAPI:
         )
         experiments = [dict(r["e"]) for r in exp_records]
 
-        persona = _persona_store.get(f"{session_id}:{req.agent_id}")
+        persona = await load_persona(dag_client, session_id, req.agent_id)
 
-        # Build grounded context
-        context = {
-            "agent_id": req.agent_id,
-            "findings": findings,
-            "experiments": experiments,
-            "persona": persona.model_dump() if persona else None,
-            "prompt": req.prompt,
-        }
+        # Build grounded context for LLM
+        findings_text = "\n".join(
+            f"- [{f.get('confidence', 0):.2f}] {f.get('claim', 'N/A')} (evidence: {f.get('evidence_type', 'N/A')}, tier: {f.get('min_source_tier', '?')})"
+            for f in findings[:10]
+        ) or "No findings posted yet."
 
-        # In production, this would call LLM with the agent's context
-        # For now, return structured context for the interviewer
+        experiments_text = "\n".join(
+            f"- {e.get('goal', 'N/A')} (status: {e.get('status', 'N/A')}, backend: {e.get('backend_type', 'N/A')})"
+            for e in experiments
+        ) or "No experiments submitted yet."
+
+        persona_text = f"Specialty: {persona.specialty}, Skepticism: {persona.skepticism_level:.0%}" if persona else "No persona set."
+
+        hypothesis = _extract_current_hypothesis(findings)
+        hypothesis_text = f"{hypothesis['claim']} (confidence: {hypothesis['confidence']:.2f})" if hypothesis else "No clear hypothesis yet."
+
+        # Call LLM for grounded response
+        llm = get_llm_client()
+        system_prompt = (
+            "You are a research agent being interviewed about your work. "
+            "Answer based ONLY on the findings, experiments, and persona provided. "
+            "Do not invent new claims. If you don't have evidence for something, say so. "
+            "Be honest about uncertainty. Reference specific findings when relevant."
+        )
+
+        user_prompt = f"""## Your Research Context
+
+**Current hypothesis:** {hypothesis_text}
+
+**Your persona:** {persona_text}
+
+**Your findings:**
+{findings_text}
+
+**Your experiments:**
+{experiments_text}
+
+## Interview Question
+
+{req.prompt}
+
+Answer as this agent would, grounded in the evidence above."""
+
+        try:
+            grounded_response = llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.5,
+                max_tokens=1024,
+            )
+        except Exception as e:
+            grounded_response = f"LLM call failed: {str(e)}. Context provided for manual review."
+
         response = {
             "agent_id": req.agent_id,
             "prompt": req.prompt,
+            "grounded_response": grounded_response,
             "context_summary": {
                 "findings_count": len(findings),
                 "experiments_count": len(experiments),
-                "current_hypothesis": _extract_current_hypothesis(findings),
+                "current_hypothesis": hypothesis,
                 "persona_specialty": persona.specialty if persona else "general",
             },
-            "grounded_response": "Interview requires LLM integration. Context is provided for external processing.",
-            "context": context,
         }
 
         audit.log(session_id, EventType.INTERVIEW_COMPLETED, {
             "agent_id": req.agent_id,
             "findings_used": len(findings),
+            "response_length": len(grounded_response),
         }, agent_id=req.agent_id)
 
         return response
