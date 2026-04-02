@@ -47,7 +47,7 @@ Returns:
 
 ### P3: Persona Revision System
 
-**New:** `hive/agents/persona.py`
+**New:** `squid/agents/persona.py`
 
 8 research-specialization templates:
 - `pharmacology` — high source strictness, moderate skepticism
@@ -84,7 +84,7 @@ Interviews are read-only. They read the agent's findings, experiments, persona, 
 
 ### P5: Tool-Using Report Agent
 
-**New:** `hive/coordinator/report_agent.py`
+**New:** `squid/coordinator/report_agent.py`
 
 ReportAgent uses ReACT-style tool calling:
 - `read_finding(id)` — read specific finding
@@ -107,7 +107,7 @@ Preserves honest-contract output:
 
 ### P6: Audit Logging
 
-**New:** `hive/coordinator/audit.py`
+**New:** `squid/coordinator/audit.py`
 
 Structured JSONL audit log per session. Events:
 - Session lifecycle, agent lifecycle, experiment lifecycle

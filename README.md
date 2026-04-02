@@ -26,7 +26,7 @@ pip install research-squid
 ```
 
 ```python
-from hive import Finding, ExperimentSpec, Session
+from squid import Finding, ExperimentSpec, Session
 from squid.dag import post_finding, post_experiment_result
 from squid.coordinator import create_session
 ```
@@ -38,7 +38,7 @@ squid-mcp --transport stdio
 # Add to claude_code MCP config
 ```
 
-5 MCP tools: `hive_start_session`, `hive_get_status`, `hive_get_summary`, `hive_submit_experiment`, `hive_stop_session`
+5 MCP tools: `squid_start_session`, `squid_get_status`, `squid_get_summary`, `squid_submit_experiment`, `squid_stop_session`
 
 ## Use from WhatsApp/Telegram
 
@@ -58,9 +58,9 @@ Install OpenClaw, add research-squid skill. Message: "research cheaper alternati
 
 ## Adding a Backend
 
-1. Create `hive/backends/my_backend/executor.py`
+1. Create `squid/backends/my_backend/executor.py`
 2. Implement `BaseBackend.run_experiment()`
-3. Add one line to `hive/backends/registry.py`
+3. Add one line to `squid/backends/registry.py`
 4. Done
 
 See [docs/adding-a-backend.md](docs/adding-a-backend.md)

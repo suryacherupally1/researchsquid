@@ -5,8 +5,8 @@ WORKDIR /app
 COPY pyproject.toml .
 RUN pip install --no-cache-dir -e .
 
-COPY hive/ /app/hive/
+COPY squid/ /app/squid/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "hive.coordinator.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "squid.coordinator.app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -4,9 +4,9 @@ One file. Implement `BaseBackend`. Register in `registry.py`.
 
 ## Steps
 
-1. Create `hive/backends/my_new_backend/executor.py`
+1. Create `squid/backends/my_new_backend/executor.py`
 2. Implement `BaseBackend.validate_inputs()` and `BaseBackend.run_experiment()`
-3. Add one line to `hive/backends/registry.py`
+3. Add one line to `squid/backends/registry.py`
 4. Done — Coordinator routes to it automatically
 
 ## Example
