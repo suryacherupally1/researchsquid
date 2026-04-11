@@ -10,6 +10,7 @@ or model_name settings use different models through the same client.
 """
 
 import json
+import logging
 import re
 import time
 from typing import Any, TypeVar
@@ -18,6 +19,9 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from src.config import Settings, settings as default_settings
+from src.llm.pricing import get_pricing_manager
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -80,22 +84,51 @@ class LLMClient:
         self._total_cost = 0.0
         self._last_usage = None
 
-    def _capture_usage(self, response: Any) -> dict[str, Any]:
+    async def _capture_usage(
+        self, 
+        response: Any, 
+        usage_accumulator: dict[str, Any] | None = None,
+        model_override: str | None = None
+    ) -> dict[str, Any]:
         """Extract usage data from API response."""
         usage = response.usage
-        cost = getattr(usage, "total_cost", None)
+        if not usage:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0}
+
+        # Resolve cost using the pricing manager
+        manager = get_pricing_manager()
+        model_to_price = model_override or self._model
+        
+        # Check if response has OpenRouter specific total_cost
+        cost_val = getattr(usage, "total_cost", None)
+        
+        if cost_val is None:
+            # Calculate estimate using ground truth or OR models API
+            res = await manager.estimate_cost(
+                model_name=model_to_price,
+                usage_obj=usage,
+                base_url=self._config.openai_api_base
+            )
+            cost_val = res.amount_usd
+
+        cost = float(cost_val)
         
         usage_data = {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+            "completion_tokens": getattr(usage, "completion_tokens", 0),
+            "total_tokens": getattr(usage, "total_tokens", 0),
             "cost": cost,
         }
         
-        self._total_tokens += usage.total_tokens
-        if cost is not None:
-            self._total_cost += cost
+        self._total_tokens += usage_data["total_tokens"]
+        self._total_cost += cost
         self._last_usage = usage_data
+
+        if usage_accumulator is not None:
+            usage_accumulator["prompt_tokens"] = usage_accumulator.get("prompt_tokens", 0) + usage_data["prompt_tokens"]
+            usage_accumulator["completion_tokens"] = usage_accumulator.get("completion_tokens", 0) + usage_data["completion_tokens"]
+            usage_accumulator["total_tokens"] = usage_accumulator.get("total_tokens", 0) + usage_data["total_tokens"]
+            usage_accumulator["cost"] = usage_accumulator.get("cost", 0.0) + cost
         
         return usage_data
 
@@ -134,6 +167,7 @@ class LLMClient:
         system: str = "",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        usage_accumulator: dict[str, Any] | None = None,
     ) -> str:
         """
         Send a prompt and return the text response.
@@ -165,7 +199,7 @@ class LLMClient:
             ),
         )
         self._call_count += 1
-        self._capture_usage(response)
+        await self._capture_usage(response, usage_accumulator=usage_accumulator)
         return response.choices[0].message.content or ""
 
     async def complete_structured(
@@ -177,6 +211,7 @@ class LLMClient:
         max_tokens: int | None = None,
         max_retries: int | None = None,
         model_override: str | None = None,
+        usage_accumulator: dict[str, Any] | None = None,
     ) -> T:
         """
         Send a prompt and parse the response into a Pydantic model.
@@ -239,7 +274,11 @@ class LLMClient:
             )
             elapsed = time.time() - start_time
             self._call_count += 1
-            self._capture_usage(response)
+            await self._capture_usage(
+                response, 
+                usage_accumulator=usage_accumulator,
+                model_override=model
+            )
 
             raw = response.choices[0].message.content or "{}"
 
@@ -248,13 +287,22 @@ class LLMClient:
 
             try:
                 normalized = self._normalize_structured_json(raw)
-                # DIAGNOSTIC: Log successful LLM call timing
-                #print(f"[TIMING] LLM complete_structured SUCCESS: {elapsed:.2f}s (attempt {attempt+1}/{retry_limit+1}, model={self._model}, tokens={current_max_tokens})")
-                return response_model.model_validate(json.loads(normalized))
+                parsed = response_model.model_validate(json.loads(normalized))
+                logger.warning(
+                    f"LLM structured call OK: model={model}, "
+                    f"elapsed={elapsed:.2f}s, attempt={attempt+1}, "
+                    f"finish_reason={finish_reason}, "
+                    f"raw_len={len(raw)}"
+                )
+                return parsed
             except Exception as e:
                 last_error = e
-                # DIAGNOSTIC: Log retry
-                #print(f"[TIMING] LLM complete_structured RETRY: {elapsed:.2f}s (attempt {attempt+1}/{retry_limit+1}, error={type(e).__name__}: {str(e)[:80]})")
+                logger.warning(
+                    f"LLM structured parse FAILED: model={model}, "
+                    f"attempt={attempt+1}/{retry_limit+1}, "
+                    f"error={type(e).__name__}: {str(e)[:200]}, "
+                    f"raw_preview={raw[:500]}"
+                )
                 if attempt < retry_limit:
                     retry_reason = (
                         "Your previous response was truncated."
@@ -289,6 +337,7 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         max_retries: int | None = None,
+        usage_accumulator: dict[str, Any] | None = None,
     ) -> T:
         """
         Structured completion using the model resolved from a persona.
@@ -320,6 +369,7 @@ class LLMClient:
             max_tokens=max_tokens,
             max_retries=max_retries,
             model_override=model,
+            usage_accumulator=usage_accumulator,
         )
 
     @staticmethod
@@ -369,8 +419,12 @@ class LLMClient:
         Returns:
             List of embedding vectors, one per input text.
         """
+        logger.debug(f"Generating embeddings for {len(texts)} texts using {self._config.embedding_model}")
         response = await self._client.embeddings.create(
             model=self._config.embedding_model,
             input=texts,
         )
-        return [item.embedding for item in response.data]
+        results = [item.embedding for item in response.data]
+        if not results:
+            logger.warning(f"OpenAI returned empty embedding data for {len(texts)} inputs.")
+        return results

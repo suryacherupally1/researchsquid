@@ -401,6 +401,7 @@ class DebateCycleBuilder:
         # Find hypotheses challenged in this round (have recent
         # "challenge" or "refute" findings)
         from src.models.claim import Finding
+        from src.models.message import Message, MessageType
 
         # Get recent findings from this iteration with challenge/refute conclusions
         all_findings = await self._graph.get_by_label(
@@ -500,6 +501,21 @@ class DebateCycleBuilder:
                 failed_responses += 1
             else:
                 completed_responses += 1
+                
+                # Persist counter-response as a Message
+                try:
+                    msg = Message(
+                        from_agent=job["author_id"],
+                        to_agent="",  # Broadcast
+                        text=response,
+                        message_type=MessageType.EVIDENCE if "REBUT" in response else MessageType.ACKNOWLEDGMENT if "ACCEPT" in response else MessageType.QUESTION,
+                        regarding_artifact_id=job["hypothesis_id"],
+                        created_by=job["author_id"],
+                        session_id=state.get("session_id", ""),
+                    )
+                    await self._graph.create_message(msg)
+                except Exception as e:
+                    pass  # Graceful fallback if save fails
 
             await self._bus.publish(Event(
                 event_type=EventType.AGENT_ACTION,

@@ -22,10 +22,11 @@ dependencies = [
     # Knowledge Graph
     "neo4j>=5.0",
 
-    # Database
+    # Database & Memory
     "asyncpg>=0.29",
     "pgvector>=0.3",
     "sqlalchemy[asyncio]>=2.0",
+    "hindsight-all>=0.1",
 
     # Data Models & Config
     "pydantic>=2.0",

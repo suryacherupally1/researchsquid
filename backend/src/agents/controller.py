@@ -131,6 +131,13 @@ class ControllerAgent:
             for m in all_metrics
         )
 
+        # Compute convergence metrics
+        from src.orchestration.convergence import compute_convergence
+        convergence = await compute_convergence(
+            self._queries, session_id, self._config
+        )
+        convergence_text = convergence.summary_text()
+
         prompt = CONTROLLER_EVALUATE.format(
             research_question=state.get("research_question", ""),
             subproblems=subproblems_text,
@@ -141,7 +148,11 @@ class ControllerAgent:
             ),
             budget_remaining=state.get("budget_remaining_usd", 0.0),
             budget_total=state.get("budget_total_usd", self._config.default_budget_usd),
-            graph_stats=stats_text + f"\n\n=== AGENT PERFORMANCE ===\n{agent_perf_text}",
+            graph_stats=(
+                stats_text
+                + f"\n\n=== AGENT PERFORMANCE ===\n{agent_perf_text}"
+                + f"\n\n=== CONVERGENCE METRICS ===\n{convergence_text}"
+            ),
             contradictions=contradictions_text,
         )
 
@@ -157,13 +168,20 @@ class ControllerAgent:
         iteration = state.get("iteration", 0)
         max_iter = state.get("max_iterations", self._config.default_iterations)
 
+        # Convergence-based auto-stop
+        converged = convergence.convergence_score >= self._config.convergence_threshold
         force_stop = budget_usd <= 0 or iteration >= max_iter
-        should_stop = output.should_stop or force_stop
+        should_stop = output.should_stop or force_stop or converged
 
         if force_stop and not output.should_stop:
             output.reasoning += (
                 f" [FORCED STOP: budget=${budget_usd:.2f}, "
                 f"iteration={iteration}/{max_iter}]"
+            )
+        elif converged and not output.should_stop:
+            output.reasoning += (
+                f" [CONVERGENCE STOP: score={convergence.convergence_score:.2f} "
+                f">= threshold={self._config.convergence_threshold}]"
             )
 
         output.reasoning = self._humanize_agent_references(
@@ -231,6 +249,7 @@ class ControllerAgent:
             "coverage": output.coverage_assessment,
             "controller_directives": output.directives,
             "agents": agents,
+            "convergence_metrics": convergence.to_dict(),
         }
 
     @staticmethod

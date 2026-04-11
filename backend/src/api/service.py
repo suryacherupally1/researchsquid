@@ -30,6 +30,7 @@ from src.search.arxiv import ArxivSearch
 from src.search.tavily import TavilySearch
 from src.session_context import reset_current_session_id, set_current_session_id
 from src.workspace.manager import WorkspaceManager
+from src.memory.server import HindsightManager
 
 
 class ResearchService:
@@ -68,6 +69,7 @@ class ResearchService:
         self._tavily: TavilySearch | None = None
         self._arxiv: ArxivSearch | None = None
         self._workspace_manager: WorkspaceManager | None = None
+        self._memory_manager: HindsightManager | None = None
         self._initialized = False
 
     @property
@@ -151,6 +153,11 @@ class ResearchService:
             self._workspace_manager = WorkspaceManager(self._config, self._event_bus)
             await self._workspace_manager.initialize()
 
+        # Hindsight memory layer
+        if getattr(self._config, "hindsight_enabled", False):
+            self._memory_manager = HindsightManager(self._config)
+            await self._memory_manager.start()
+
         self._initialized = True
 
     async def shutdown(self) -> None:
@@ -159,6 +166,8 @@ class ResearchService:
             await self._neo4j.close()
         if self._postgres:
             await self._postgres.close()
+        if self._memory_manager:
+            await self._memory_manager.stop()
         self._initialized = False
 
     async def start_research(
@@ -221,6 +230,7 @@ class ResearchService:
                 arxiv_search=self._arxiv,
                 config=self._config,
                 workspace_manager=self._workspace_manager,
+                memory_manager=self._memory_manager,
             )
 
             compiled = builder.build()
@@ -241,6 +251,9 @@ class ResearchService:
             result["session_id"] = resolved_session_id
             return result
         finally:
+            # Clean up lingering workspace servers
+            await self._workspace_manager.snapshot_session(resolved_session_id)
+            await self._workspace_manager.stop_all_servers(resolved_session_id)
             reset_current_session_id(token)
 
     async def get_graph_export(self) -> dict[str, Any]:

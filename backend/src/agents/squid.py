@@ -11,6 +11,7 @@ differently from an empiricist, even on the same subproblem.
 """
 
 import asyncio
+import logging
 import time
 from collections import defaultdict
 from typing import Any
@@ -35,6 +36,8 @@ from src.rag.retriever import RAGRetriever
 from src.search.arxiv import ArxivSearch
 from src.search.tavily import TavilySearch
 from src.agents.workspace_tools import WorkspaceTools, OpenCodeTask
+
+logger = logging.getLogger(__name__)
 
 
 class SquidOutput(BaseModel):
@@ -84,6 +87,8 @@ class SquidAgent:
         arxiv_search: ArxivSearch | None = None,
         config: Settings | None = None,
         workspace_tools: WorkspaceTools | None = None,
+        graph_queries: Any | None = None,
+        agent_memory: Any | None = None,
     ) -> None:
         self._llm = llm
         self._graph = graph
@@ -94,6 +99,8 @@ class SquidAgent:
         self._arxiv = arxiv_search
         self._config = config or default_settings
         self._workspace = workspace_tools
+        self._graph_queries = graph_queries
+        self._memory = agent_memory
         self._source_ingest_locks: dict[str, asyncio.Lock] = defaultdict(
             asyncio.Lock
         )
@@ -140,6 +147,7 @@ class SquidAgent:
             query,
             top_k=self._config.retrieval_agent_context_top_k,
             session_id=session_id,
+            graph_queries=self._graph_queries,
         )
         #print(f"[TIMING] Squid {agent_id[:12]} RAG retrieval: {time.time() - rag_start:.2f}s")
 
@@ -154,6 +162,14 @@ class SquidAgent:
         source_chunks = self._format_artifacts(context.get("source_chunk", []))
         existing_work = self._format_existing_work(context)
         messages_text = self._format_messages(unread)
+
+        # 3b. Hindsight memory recall — augments RAG with agent's working memory
+        memory_section = ""
+        if self._memory:
+            mem_context = await self._memory.recall_for_research(query)
+            private = mem_context.get("private_memories")
+            if private:
+                memory_section = self._format_memory_context(private)
 
         # 4. Build system prompt with persona injection
         system_prompt = SQUID_SYSTEM
@@ -177,7 +193,10 @@ class SquidAgent:
             source_chunks=source_chunks or "No source material found yet.",
             existing_work=existing_work or "No existing work from other agents.",
             messages=messages_text or "No messages.",
-        ) + briefing_section
+        ) + briefing_section + memory_section
+
+        # Define usage tracking for this specific execution
+        usage_accumulator: dict[str, Any] = {"cost": 0.0}
 
         # Use persona-aware model selection if persona exists
         if persona:
@@ -187,6 +206,7 @@ class SquidAgent:
                 persona=persona,
                 system=system_prompt,
                 temperature=self._config.temperature_squid,
+                usage_accumulator=usage_accumulator,
             )
         else:
             output = await self._llm.complete_structured(
@@ -194,12 +214,26 @@ class SquidAgent:
                 response_model=SquidOutput,
                 system=system_prompt,
                 temperature=self._config.temperature_squid,
+                usage_accumulator=usage_accumulator,
             )
         #print(f"[TIMING] Squid {agent_id[:12]} LLM call: {time.time() - llm_start:.2f}s")
+
+        logger.warning(
+            f"Squid {agent_id[:12]} LLM output: "
+            f"notes={len(output.notes)}, "
+            f"hypotheses={len(output.hypotheses)}, "
+            f"assumptions={len(output.assumptions)}, "
+            f"search_queries={len(output.search_queries)}, "
+            f"experiments={len(output.experiment_proposals)}, "
+            f"messages={len(output.messages)}, "
+            f"cost=${usage_accumulator.get('cost', 0.0):.6f}"
+        )
 
         # 5. Store all artifacts in the graph
         store_start = time.time()
         result = await self._store_artifacts(output, agent_id, state)
+        # Attach the precise agent iteration cost
+        result["spent_usd"] = usage_accumulator.get("cost", 0.0)
         #print(f"[TIMING] Squid {agent_id[:12]} store artifacts: {time.time() - store_start:.2f}s")
 
         # 5b. Workspace updates — only if workspace layer is active
@@ -237,6 +271,21 @@ class SquidAgent:
         )
         # if output.search_queries:
             #print(f"[TIMING] Squid {agent_id[:12]} searches: {time.time() - search_start:.2f}s")
+
+        # 7. Retain this iteration's work in Hindsight memory
+        if self._memory:
+            iteration = state.get("iteration", 0)
+            findings_summary = self._summarize_iteration_for_memory(output)
+            agent_hypotheses = await self._graph.get_by_label(
+                "Hypothesis",
+                filters={"created_by": agent_id, "session_id": session_id},
+                limit=20,
+            )
+            await self._memory.retain_iteration(
+                iteration=iteration,
+                findings_summary=findings_summary,
+                hypotheses=agent_hypotheses,
+            )
 
         #print(f"[TIMING] Squid {agent_id[:12]} TOTAL: {time.time() - squid_start:.2f}s")
 
@@ -444,100 +493,112 @@ class SquidAgent:
         agent_id: str,
         session_id: str,
     ) -> None:
-        """Download and ingest discovered arXiv papers into shared memory."""
-        if not self._indexer:
+        """Download and ingest discovered arXiv papers into shared memory in parallel."""
+        if not self._indexer or not papers:
             return
 
-        for paper in papers:
-            arxiv_id = str(paper.get("arxiv_id", "")).strip()
-            if not arxiv_id:
-                continue
+        tasks = [
+            self._ingest_single_arxiv_paper(paper, agent_id, session_id)
+            for paper in papers
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-            canonical_uri = f"arxiv:{arxiv_id}"
-            async with self._source_ingest_locks[canonical_uri]:
-                existing = await self._graph.get_by_label(
-                    "Source",
-                    filters={
-                        "uri": canonical_uri,
-                        "session_id": session_id,
-                    },
-                    limit=1,
-                )
-                if existing:
-                    await self._bus.publish(Event(
-                        event_type=EventType.AGENT_ACTION,
-                        agent_id=agent_id,
-                        payload={
-                            "action": "search_source_already_ingested",
-                            "source": "arxiv",
-                            "title": paper.get("title", ""),
-                            "arxiv_id": arxiv_id,
-                            "source_id": existing[0].get("id", ""),
-                        },
-                    ))
-                    continue
+    async def _ingest_single_arxiv_paper(
+        self,
+        paper: dict[str, Any],
+        agent_id: str,
+        session_id: str,
+    ) -> None:
+        """Worker to download and ingest a single arXiv paper."""
+        arxiv_id = str(paper.get("arxiv_id", "")).strip()
+        if not arxiv_id:
+            return
 
+        canonical_uri = f"arxiv:{arxiv_id}"
+        async with self._source_ingest_locks[canonical_uri]:
+            existing = await self._graph.get_by_label(
+                "Source",
+                filters={
+                    "uri": canonical_uri,
+                    "session_id": session_id,
+                },
+                limit=1,
+            )
+            if existing:
                 await self._bus.publish(Event(
                     event_type=EventType.AGENT_ACTION,
                     agent_id=agent_id,
                     payload={
-                        "action": "downloading_source",
+                        "action": "search_source_already_ingested",
                         "source": "arxiv",
                         "title": paper.get("title", ""),
                         "arxiv_id": arxiv_id,
+                        "source_id": existing[0].get("id", ""),
                     },
                 ))
+                return
 
-                try:
-                    pdf_path = await self._arxiv.download(
-                        arxiv_id,
-                        agent_id=agent_id,
-                    )
-                    await self._bus.publish(Event(
-                        event_type=EventType.AGENT_ACTION,
-                        agent_id=agent_id,
-                        payload={
-                            "action": "ingesting_source",
-                            "source": "arxiv",
-                            "title": paper.get("title", ""),
-                            "arxiv_id": arxiv_id,
-                            "progress": 100,
-                            "stage": "ingesting",
-                        },
-                    ))
-                    source_id = await self._indexer.ingest_pdf(pdf_path, agent_id)
-                    await self._graph.update(
-                        source_id,
-                        {
-                            "source_type": "arxiv",
-                            "uri": canonical_uri,
-                            "title": paper.get("title", ""),
-                            "file_path": pdf_path,
-                        },
-                    )
-                    await self._bus.publish(Event(
-                        event_type=EventType.AGENT_ACTION,
-                        agent_id=agent_id,
-                        payload={
-                            "action": "ingested_search_source",
-                            "source": "arxiv",
-                            "title": paper.get("title", ""),
-                            "arxiv_id": arxiv_id,
-                            "source_id": source_id,
-                            "file_path": pdf_path,
-                        },
-                    ))
-                except Exception as exc:
-                    await self._bus.publish(Event(
-                        event_type=EventType.ERROR,
-                        agent_id=agent_id,
-                        payload={
-                            "error": (
-                                f"Failed to download or ingest arXiv paper "
-                                f"{arxiv_id}: {exc}"
-                            ),
-                        },
-                    ))
+            await self._bus.publish(Event(
+                event_type=EventType.AGENT_ACTION,
+                agent_id=agent_id,
+                payload={
+                    "action": "downloading_source",
+                    "source": "arxiv",
+                    "title": paper.get("title", ""),
+                    "arxiv_id": arxiv_id,
+                },
+            ))
+
+            try:
+                pdf_path = await self._arxiv.download(
+                    arxiv_id,
+                    agent_id=agent_id,
+                )
+                await self._bus.publish(Event(
+                    event_type=EventType.AGENT_ACTION,
+                    agent_id=agent_id,
+                    payload={
+                        "action": "ingesting_source",
+                        "source": "arxiv",
+                        "title": paper.get("title", ""),
+                        "arxiv_id": arxiv_id,
+                        "progress": 100,
+                        "stage": "ingesting",
+                    },
+                ))
+                source_id = await self._indexer.ingest_pdf(pdf_path, agent_id)
+                await self._graph.update(
+                    source_id,
+                    {
+                        "source_type": "arxiv",
+                        "uri": canonical_uri,
+                        "title": paper.get("title", ""),
+                        "file_path": pdf_path,
+                    },
+                )
+                await self._bus.publish(Event(
+                    event_type=EventType.AGENT_ACTION,
+                    agent_id=agent_id,
+                    payload={
+                        "action": "ingested_search_source",
+                        "source": "arxiv",
+                        "title": paper.get("title", ""),
+                        "arxiv_id": arxiv_id,
+                        "source_id": source_id,
+                        "file_path": pdf_path,
+                    },
+                ))
+            except Exception as exc:
+                await self._bus.publish(Event(
+                    event_type=EventType.ERROR,
+                    agent_id=agent_id,
+                    payload={
+                        "error": (
+                            f"Failed to download or ingest arXiv paper "
+                            f"{arxiv_id}: {exc}"
+                        ),
+                    },
+                ))
 
     def _summarize_iteration_for_memory(self, output: SquidOutput) -> str:
         """
@@ -577,12 +638,27 @@ class SquidAgent:
     def _format_existing_work(self, context: dict[str, list[dict]]) -> str:
         """Format all existing work (excluding source chunks) for the prompt."""
         parts = []
-        for atype in ["note", "hypothesis", "assumption", "finding"]:
+        for atype in ["note", "hypothesis", "assumption", "finding", "experiment_result"]:
             artifacts = context.get(atype, [])
             if artifacts:
                 parts.append(f"\n=== {atype.upper()}S ===")
-                parts.append(self._format_artifacts(artifacts))
+                if atype == "experiment_result":
+                    parts.append(self._format_experiment_results(artifacts))
+                else:
+                    parts.append(self._format_artifacts(artifacts))
         return "\n".join(parts)
+
+    def _format_experiment_results(self, results: list[dict]) -> str:
+        """Format experiment results for the prompt — emphasis on what was tested and what happened."""
+        parts = []
+        for r in results[:10]:  # Cap at 10 to avoid prompt bloat
+            parts.append(
+                f"[experiment_result] (exit_code: {r.get('exit_code', '?')}, "
+                f"experiment: {(r.get('experiment_id', '') or r.get('id', '?'))[:12]})\n"
+                f"Stdout: {(r.get('stdout', '') or '')[:300]}\n"
+                f"Interpretation: {r.get('interpretation', 'None')}"
+            )
+        return "\n---\n".join(parts)
 
     def _format_messages(self, messages: list[dict]) -> str:
         """
@@ -619,3 +695,19 @@ class SquidAgent:
                 f" (re: {m.get('regarding_artifact_id', 'general')})"
             )
         return "\n".join(parts)
+
+    def _format_memory_context(self, memories: list[dict] | Any) -> str:
+        """Format Hindsight recall results into a prompt section."""
+        if not memories:
+            return ""
+        parts = ["\n\n=== AGENT WORKING MEMORY ==="]
+        if isinstance(memories, list):
+            for m in memories[:8]:
+                text = m.get("content", m.get("text", str(m)))[:300]
+                parts.append(f"- {text}")
+        elif isinstance(memories, str):
+            parts.append(memories[:2000])
+        else:
+            parts.append(str(memories)[:2000])
+        return "\n".join(parts)
+

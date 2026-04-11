@@ -6,6 +6,8 @@ embedding in a single pipeline. This is the main entry point for
 adding new research material to the institute.
 """
 
+import asyncio
+from typing import Any
 from src.graph.repository import GraphRepository
 from src.ingest.chunker import TextChunker
 from src.ingest.pdf import PDFIngestor
@@ -97,6 +99,22 @@ class RAGIndexer:
         )
         return await self._process_source(source, sections, agent_id)
 
+    async def index_artifact(self, artifact: Any) -> str | None:
+        """Embed an unsupported standalone artifact like a Finding."""
+        if not hasattr(artifact, "text") or not artifact.text:
+            return None
+        
+        artifact_type = artifact.__class__.__name__.lower()
+        embedding_id = await self._vector_store.store_embedding(
+            artifact_id=artifact.id,
+            artifact_type=artifact_type,
+            content=artifact.text,
+            metadata={"tags": getattr(artifact, "tags", [])},
+        )
+        if hasattr(self._graph, "update"):
+            await self._graph.update(artifact.id, {"embedding_id": embedding_id})
+        return embedding_id
+
     async def _process_source(
         self,
         source: Source,
@@ -128,21 +146,25 @@ class RAGIndexer:
         # 2. Chunk the text
         chunks = self._chunker.chunk(sections, source.id, agent_id)
 
-        # 3. Store chunks and link to source
+        # 3. Store chunks and link to source in DB (fast/sync relative to API)
         for chunk in chunks:
             chunk.text = self._sanitize_text(chunk.text)
             chunk.section_title = self._sanitize_text(chunk.section_title)
             await self._graph.create(chunk)
             await self._graph.link_chunk_to_source(chunk.id, source.id)
 
-            # 4. Embed chunk text
-            embedding_id = await self._vector_store.store_embedding(
-                artifact_id=chunk.id,
+        # 4. Embed chunk text concurrently
+        async def _embed_chunk(c):
+            emb_id = await self._vector_store.store_embedding(
+                artifact_id=c.id,
                 artifact_type="source_chunk",
-                content=chunk.text,
-                metadata={"source_id": source.id, "section": chunk.section_title},
+                content=c.text,
+                metadata={"source_id": source.id, "section": c.section_title},
             )
-            await self._graph.update(chunk.id, {"embedding_id": embedding_id})
+            await self._graph.update(c.id, {"embedding_id": emb_id})
+
+        embed_tasks = [_embed_chunk(c) for c in chunks]
+        await asyncio.gather(*embed_tasks)
 
         # 5. Generate hierarchical summaries
         summary_notes = await self._summarizer.summarize(
@@ -155,13 +177,18 @@ class RAGIndexer:
             await self._graph.create(note)
             await self._graph.create_edge(source.id, note.id, "HAS_SUMMARY")
 
-            embedding_id = await self._vector_store.store_embedding(
-                artifact_id=note.id,
+        # Embed summary notes concurrently
+        async def _embed_note(n):
+            emb_id = await self._vector_store.store_embedding(
+                artifact_id=n.id,
                 artifact_type="note",
-                content=note.text,
-                metadata={"source_id": source.id, "tags": note.tags},
+                content=n.text,
+                metadata={"source_id": source.id, "tags": n.tags},
             )
-            await self._graph.update(note.id, {"embedding_id": embedding_id})
+            await self._graph.update(n.id, {"embedding_id": emb_id})
+
+        note_embed_tasks = [_embed_note(n) for n in summary_notes]
+        await asyncio.gather(*note_embed_tasks)
 
         # Emit event
         await self._bus.publish(Event(

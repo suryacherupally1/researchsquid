@@ -9,6 +9,7 @@ so they can understand structure before deep-diving into specific
 chunks via RAG.
 """
 
+import asyncio
 from src.llm.client import LLMClient
 from src.models.note import Note
 
@@ -47,20 +48,20 @@ class HierarchicalSummarizer:
             List of Note models — one per section plus one overall summary.
         """
         notes: list[Note] = []
-        section_summaries: list[str] = []
-
-        # Summarize each section
-        for section in sections:
+        
+        # Limit concurrent LLM calls to prevent rate limiting
+        semaphore = asyncio.Semaphore(10)
+        
+        async def _process_section(section: dict[str, str]) -> tuple[str, Note | None]:
             text = section.get("text", "")
             title = section.get("section_title", "")
 
             if not text.strip() or len(text) < 100:
                 # Too short to summarize — use as-is
-                section_summaries.append(text)
-                continue
+                return text, None
 
-            summary = await self._summarize_section(text, title)
-            section_summaries.append(summary)
+            async with semaphore:
+                summary = await self._summarize_section(text, title)
 
             note = Note(
                 text=f"[Section Summary: {title}] {summary}" if title else f"[Section Summary] {summary}",
@@ -70,7 +71,19 @@ class HierarchicalSummarizer:
                 provenance=[source_id],
                 tags=["summary", "section"],
             )
-            notes.append(note)
+            return summary, note
+
+        tasks = [_process_section(sec) for sec in sections]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        section_summaries: list[str] = []
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            summary, note = res
+            section_summaries.append(summary)
+            if note:
+                notes.append(note)
 
         # Generate overall document summary from section summaries
         if section_summaries:

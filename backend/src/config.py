@@ -292,6 +292,55 @@ class Settings(BaseSettings):
         ]
     )
 
+    # ── Evidence Loop ────────────────────────────────────────────────
+    evidence_support_weight: float = Field(
+        default=0.15,
+        description="How much a 'supports' finding nudges confidence up.",
+    )
+    evidence_refute_weight: float = Field(
+        default=0.25,
+        description="How much a 'refutes' finding nudges confidence down. "
+        "Asymmetric — refutation is a stronger signal than support.",
+    )
+    evidence_partial_weight: float = Field(
+        default=0.05,
+        description="How much a 'partial' finding nudges confidence up.",
+    )
+
+    # ── Parallel Experiments ─────────────────────────────────────────
+    max_parallel_experiments: int = Field(
+        default=4,
+        description="Concurrency cap for sandbox container execution.",
+    )
+
+    # ── Convergence Detection ─────────────────────────────────────────
+    convergence_threshold: float = Field(
+        default=0.75,
+        description="Auto-stop when convergence score exceeds this.",
+    )
+
+    # ── Hindsight Memory ─────────────────────────────────────────────
+    hindsight_enabled: bool = Field(
+        default=True,
+        description="Enable Hindsight memory layer.",
+    )
+    hindsight_data_dir: str = Field(
+        default=str(REPO_ROOT / "data" / "hindsight"),
+        description="Directory for Hindsight server data.",
+    )
+    hindsight_port: int = Field(
+        default=8930,
+        description="Port for embedded Hindsight server.",
+    )
+    hindsight_llm_provider: str = Field(
+        default="openai",
+        description="LLM provider for Hindsight operations.",
+    )
+    hindsight_llm_model: str = Field(
+        default="",
+        description="LLM model for Hindsight. Empty = use fast_model from config.",
+    )
+
     # ── Workspace Layer ─────────────────────────────────────────────────
     workspace_base_path: str = Field(
         default="workspaces",

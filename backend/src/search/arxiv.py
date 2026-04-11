@@ -143,7 +143,7 @@ class ArxivSearch:
             )
             async with httpx.AsyncClient(
                 follow_redirects=True,
-                timeout=None,
+                timeout=120.0,
             ) as client:
                 async with client.stream(
                     "GET",

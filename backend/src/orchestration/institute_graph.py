@@ -13,7 +13,9 @@ Flow:
       → (stop? synthesize → END)
 """
 
+import asyncio
 import json
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -30,10 +32,13 @@ from src.llm.prompts import (
     SYNTHESIZER_SYSTEM,
     SYNTHESIZER_REPORT,
     ITERATION_BRIEFING_PROMPT,
+    EXPERIMENT_INTERPRETATION_PROMPT,
 )
 from src.models.agent_state import AgentInfo, InstituteState, BeliefCluster
 from src.models.archetype import Archetype, spawn_persona_from_archetype
+from src.models.claim import Finding
 from src.models.events import Event, EventType
+from src.models.experiment import FindingInterpretation
 from src.orchestration.debate_cycle import DebateCycleBuilder
 from src.rag.indexer import RAGIndexer
 from src.rag.retriever import RAGRetriever
@@ -41,6 +46,10 @@ from src.sandbox.runner import SandboxRunner
 from src.search.arxiv import ArxivSearch
 from src.search.tavily import TavilySearch
 from src.workspace.manager import WorkspaceManager
+from src.memory.hindsight_client import AgentMemory
+from src.memory.server import HindsightManager
+
+logger = logging.getLogger(__name__)
 
 
 class InstituteGraphBuilder:
@@ -77,6 +86,7 @@ class InstituteGraphBuilder:
         arxiv_search: ArxivSearch | None = None,
         config: Settings | None = None,
         workspace_manager: WorkspaceManager | None = None,
+        memory_manager: HindsightManager | None = None,
     ) -> None:
         self._llm = llm
         self._graph = graph
@@ -89,6 +99,7 @@ class InstituteGraphBuilder:
         self._arxiv = arxiv_search
         self._config = config or default_settings
         self._workspace_manager = workspace_manager
+        self._memory_manager = memory_manager
 
         # Agent instances
         self._director = DirectorAgent(llm, event_bus, config=self._config)
@@ -119,8 +130,8 @@ class InstituteGraphBuilder:
         Returns:
             Dict with updated budget fields to merge into state
         """
-        tokens_used = state.get("tokens_used", 0) + self._llm.total_tokens
-        dollars_used = state.get("dollars_used", 0.0) + self._llm.total_cost
+        tokens_used = self._llm.total_tokens
+        dollars_used = self._llm.total_cost
         
         # Connect user's dollar budget
         budget_total_usd = float(state.get("budget_total_usd", self._config.default_budget_usd))
@@ -277,9 +288,10 @@ class InstituteGraphBuilder:
                 "key_assumptions": result.get("key_assumptions", []),
             },
         ))
+        budget_updates = await self._update_budget_state(state)
         return {
             **result,
-            **self._update_budget_state(state),
+            **budget_updates,
         }
 
     async def _spawn_squids(
@@ -470,6 +482,16 @@ class InstituteGraphBuilder:
                     event_bus=self._bus,
                 )
 
+            # Create per-agent memory if Hindsight is available
+            agent_memory = None
+            if self._memory_manager and self._memory_manager.is_running:
+                agent_memory = AgentMemory(
+                    agent_id=agent["agent_id"],
+                    session_id=session_id,
+                    client=self._memory_manager.client,
+                    config=self._config,
+                )
+
             squid = SquidAgent(
                 llm=self._llm,
                 graph=self._graph,
@@ -480,6 +502,8 @@ class InstituteGraphBuilder:
                 arxiv_search=self._arxiv,
                 config=self._config,
                 workspace_tools=workspace_tools,
+                graph_queries=self._queries,
+                agent_memory=agent_memory,
             )
 
             sci_state = SquidState(
@@ -505,6 +529,18 @@ class InstituteGraphBuilder:
 
         for agent, result in zip(active_agents, results):
             if isinstance(result, Exception):
+                logger.error(
+                    f"Agent {agent['agent_id'][:12]} ({agent.get('name', '?')}) "
+                    f"crashed: {type(result).__name__}: {result}",
+                    exc_info=result,
+                )
+                await self._bus.publish(Event(
+                    event_type=EventType.ERROR,
+                    agent_id=agent["agent_id"],
+                    payload={
+                        "error": f"Agent crashed: {type(result).__name__}: {result}",
+                    },
+                ))
                 continue
 
             all_artifacts.extend(result.get("hypotheses_created", []))
@@ -513,7 +549,8 @@ class InstituteGraphBuilder:
             # Update per-agent budget usage and empty iteration tracking
             for ua in updated_agents:
                 if ua["agent_id"] == agent["agent_id"]:
-                    ua["budget_used_usd"] = ua.get("budget_used_usd", 0.0) + 1
+                    # Track precise token cost used during this agent's run
+                    ua["budget_used_usd"] = ua.get("budget_used_usd", 0.0) + result.get("spent_usd", 0.0)
                     produced = (
                         len(result.get("hypotheses_created", []))
                         + len(result.get("notes_created", []))
@@ -526,7 +563,7 @@ class InstituteGraphBuilder:
                         ua["consecutive_empty_iterations"] = 0
                     break
 
-        # Run pending experiments
+        # Run pending experiments in parallel
         pending = await self._graph.get_by_label(
             "Experiment",
             filters={
@@ -535,87 +572,19 @@ class InstituteGraphBuilder:
             },
             limit=self._config.graph_pending_experiments_limit,
         )
-        for exp_data in pending:
-            exp_id = exp_data["id"]
-            input_data = self._decode_input_data(exp_data.get("spec_input_data", ""))
-            await self._bus.publish(Event(
-                event_type=EventType.EXPERIMENT_STARTED,
-                artifact_id=exp_id,
-                payload={
-                    "hypothesis_id": exp_data.get("hypothesis_id", ""),
-                    "expected_outcome": exp_data.get("spec_expected_outcome", ""),
-                    "code_preview": exp_data.get("spec_code", "")[:240],
-                    "input_data": input_data,
-                },
-            ))
-            try:
-                run_result = await self._sandbox.run_experiment(
-                    exp_id, exp_data
-                )
-                from src.models.experiment import ExperimentResult
-                exp_result = ExperimentResult(
-                    experiment_id=exp_id,
-                    stdout=run_result.get("stdout", ""),
-                    stderr=run_result.get("stderr", ""),
-                    exit_code=run_result.get("exit_code", -1),
-                    artifacts=run_result.get("artifacts", {}),
-                    execution_time_seconds=run_result.get("execution_time", 0.0),
-                    created_by=exp_data.get("created_by", "system"),
-                )
-                await self._graph.create(exp_result)
-                await self._graph.link_experiment_to_result(
-                    exp_id, exp_result.id
-                )
+        if pending:
+            semaphore = asyncio.Semaphore(self._config.max_parallel_experiments)
 
-                exit_code = int(run_result.get("exit_code", -1))
-                if exit_code == 0:
-                    await self._graph.update(exp_id, {"status": "completed"})
-                    await self._bus.publish(Event(
-                        event_type=EventType.EXPERIMENT_COMPLETED,
-                        artifact_id=exp_id,
-                        payload={
-                            "result_id": exp_result.id,
-                            "exit_code": exit_code,
-                            "execution_time": run_result.get("execution_time", 0.0),
-                            "stdout_preview": run_result.get("stdout", "")[:240],
-                            "stderr_preview": run_result.get("stderr", "")[:240],
-                            "artifacts": run_result.get("artifacts", {}),
-                            "input_data": input_data,
-                        },
-                    ))
-                else:
-                    await self._graph.update(exp_id, {"status": "failed"})
-                    await self._bus.publish(Event(
-                        event_type=EventType.EXPERIMENT_FAILED,
-                        artifact_id=exp_id,
-                        payload={
-                            "exit_code": exit_code,
-                            "execution_time": run_result.get("execution_time", 0.0),
-                            "error": (
-                                run_result.get("stderr", "")
-                                or run_result.get("stdout", "")
-                                or "Experiment exited with a non-zero status."
-                            )[:400],
-                            "expected_outcome": exp_data.get("spec_expected_outcome", ""),
-                            "code_preview": exp_data.get("spec_code", "")[:240],
-                            "input_data": input_data,
-                            "stdout_preview": run_result.get("stdout", "")[:240],
-                        },
-                    ))
-            except Exception as exc:
-                await self._graph.update(exp_id, {"status": "failed"})
-                await self._bus.publish(Event(
-                    event_type=EventType.EXPERIMENT_FAILED,
-                    artifact_id=exp_id,
-                    payload={
-                        "error": str(exc),
-                        "expected_outcome": exp_data.get("spec_expected_outcome", ""),
-                        "code_preview": exp_data.get("spec_code", "")[:240],
-                        "input_data": input_data,
-                    },
-                ))
+            async def _run_capped(exp_data: dict) -> None:
+                async with semaphore:
+                    await self._execute_single_experiment(
+                        exp_data, state.get("session_id", "")
+                    )
 
-        budget_updates = self._update_budget_state(state)
+            experiment_tasks = [_run_capped(exp) for exp in pending]
+            await asyncio.gather(*experiment_tasks, return_exceptions=True)
+
+        budget_updates = await self._update_budget_state(state)
 
         return {
             "agents": updated_agents,
@@ -623,6 +592,158 @@ class InstituteGraphBuilder:
             **budget_updates,
             "pending_experiments": [],
         }
+
+    async def _execute_single_experiment(
+        self, exp_data: dict, session_id: str
+    ) -> None:
+        """Execute a single experiment, create result, and auto-generate Finding."""
+        exp_id = exp_data["id"]
+        input_data = self._decode_input_data(exp_data.get("spec_input_data", ""))
+        await self._bus.publish(Event(
+            event_type=EventType.EXPERIMENT_STARTED,
+            artifact_id=exp_id,
+            payload={
+                "hypothesis_id": exp_data.get("hypothesis_id", ""),
+                "expected_outcome": exp_data.get("spec_expected_outcome", ""),
+                "code_preview": exp_data.get("spec_code", "")[:240],
+                "input_data": input_data,
+            },
+        ))
+        try:
+            run_result = await self._sandbox.run_experiment(
+                exp_id, exp_data
+            )
+            from src.models.experiment import ExperimentResult
+            exp_result = ExperimentResult(
+                experiment_id=exp_id,
+                stdout=run_result.get("stdout", ""),
+                stderr=run_result.get("stderr", ""),
+                exit_code=run_result.get("exit_code", -1),
+                artifacts=run_result.get("artifacts", {}),
+                execution_time_seconds=run_result.get("execution_time", 0.0),
+                created_by=exp_data.get("created_by", "system"),
+            )
+            await self._graph.create(exp_result)
+            await self._graph.link_experiment_to_result(
+                exp_id, exp_result.id
+            )
+
+            exit_code = int(run_result.get("exit_code", -1))
+            if exit_code == 0:
+                await self._graph.update(exp_id, {"status": "completed"})
+                await self._bus.publish(Event(
+                    event_type=EventType.EXPERIMENT_COMPLETED,
+                    artifact_id=exp_id,
+                    payload={
+                        "result_id": exp_result.id,
+                        "exit_code": exit_code,
+                        "execution_time": run_result.get("execution_time", 0.0),
+                        "stdout_preview": run_result.get("stdout", "")[:240],
+                        "stderr_preview": run_result.get("stderr", "")[:240],
+                        "artifacts": run_result.get("artifacts", {}),
+                        "input_data": input_data,
+                    },
+                ))
+            else:
+                await self._graph.update(exp_id, {"status": "failed"})
+                await self._bus.publish(Event(
+                    event_type=EventType.EXPERIMENT_FAILED,
+                    artifact_id=exp_id,
+                    payload={
+                        "exit_code": exit_code,
+                        "execution_time": run_result.get("execution_time", 0.0),
+                        "error": (
+                            run_result.get("stderr", "")
+                            or run_result.get("stdout", "")
+                            or "Experiment exited with a non-zero status."
+                        )[:400],
+                        "expected_outcome": exp_data.get("spec_expected_outcome", ""),
+                        "code_preview": exp_data.get("spec_code", "")[:240],
+                        "input_data": input_data,
+                        "stdout_preview": run_result.get("stdout", "")[:240],
+                    },
+                ))
+
+            # Auto-generate Finding from ExperimentResult
+            finding = await self._interpret_experiment_result(
+                exp_data, exp_result, session_id
+            )
+            if finding:
+                await self._graph.create(finding)
+                if finding.hypothesis_id:
+                    await self._graph.link_finding_to_hypothesis(
+                        finding.id, finding.hypothesis_id
+                    )
+                # Embed the finding for RAG retrieval
+                if self._indexer:
+                    await self._indexer.index_artifact(finding)
+                logger.info(
+                    "Auto-generated Finding %s (%s, conf=%.2f) for experiment %s",
+                    finding.id, finding.conclusion_type, finding.confidence, exp_id,
+                )
+
+        except Exception as exc:
+            await self._graph.update(exp_id, {"status": "failed"})
+            await self._bus.publish(Event(
+                event_type=EventType.EXPERIMENT_FAILED,
+                artifact_id=exp_id,
+                payload={
+                    "error": str(exc),
+                    "expected_outcome": exp_data.get("spec_expected_outcome", ""),
+                    "code_preview": exp_data.get("spec_code", "")[:240],
+                    "input_data": input_data,
+                },
+            ))
+
+    async def _interpret_experiment_result(
+        self,
+        exp_data: dict,
+        result: Any,
+        session_id: str,
+    ) -> Finding | None:
+        """
+        Ask LLM to interpret experiment output into a structured Finding.
+
+        Uses the 'fast' model tier — this is a classification task, not reasoning.
+        The LLM sees: hypothesis text, expected outcome, actual stdout/stderr, exit code.
+        It produces: conclusion_type (supports/refutes/inconclusive/partial),
+                     confidence (0-1), explanation text.
+        """
+        try:
+            # Fetch hypothesis text for context
+            hyp_id = exp_data.get("hypothesis_id", "")
+            hyp_node = await self._graph.get(hyp_id) if hyp_id else None
+            hypothesis_text = (
+                hyp_node.get("text", "") if hyp_node else "Unknown hypothesis"
+            )
+
+            prompt = EXPERIMENT_INTERPRETATION_PROMPT.format(
+                hypothesis_text=hypothesis_text,
+                expected_outcome=exp_data.get("spec_expected_outcome", ""),
+                actual_stdout=result.stdout[:2000],
+                actual_stderr=result.stderr[:500],
+                exit_code=result.exit_code,
+            )
+            interpretation = await self._llm.complete_structured(
+                prompt=prompt,
+                response_model=FindingInterpretation,
+                system="You are a scientific experiment interpreter. Be objective.",
+                temperature=self._config.temperature_default_structured,
+            )
+            return Finding(
+                text=interpretation.text,
+                hypothesis_id=hyp_id,
+                experiment_id=exp_data["id"],
+                conclusion_type=interpretation.conclusion_type,
+                confidence=interpretation.confidence,
+                created_by="system-interpreter",
+                session_id=session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to interpret experiment %s: %s", exp_data["id"], exc
+            )
+            return None
 
     @staticmethod
     def _decode_input_data(raw: Any) -> dict[str, Any]:
@@ -651,6 +772,9 @@ class InstituteGraphBuilder:
         5. Adjudication (provisional rulings on contested hypotheses)
         6. Contradiction resolution
 
+        After the debate, confidence propagation runs to update hypothesis
+        confidence from accumulated Findings.
+
         At 100 agents this produces ~350 review calls instead of ~9,900.
         """
         cost_before = self._llm.total_cost
@@ -659,6 +783,23 @@ class InstituteGraphBuilder:
         debate_graph = self._debate_builder.build()
         compiled = debate_graph.compile()
         result = await compiled.ainvoke(state)
+
+        # Close the evidence loop — propagate findings to confidence
+        session_id = state.get("session_id", "")
+        try:
+            from src.orchestration.evidence import propagate_confidence
+            confidence_updates = await propagate_confidence(
+                self._graph, self._queries, session_id,
+                self._bus, self._config,
+            )
+            if confidence_updates:
+                logger.info(
+                    "Confidence propagation updated %d hypotheses: %s",
+                    len(confidence_updates),
+                    {k: f"{v:.3f}" for k, v in confidence_updates.items()},
+                )
+        except Exception as exc:
+            logger.warning("Confidence propagation failed: %s", exc)
 
         # Extract relevant state updates from debate result
         return {
@@ -681,7 +822,7 @@ class InstituteGraphBuilder:
     ) -> dict[str, Any]:
         """Run the Controller to evaluate progress."""
         result = await self._controller.evaluate(state)
-        budget_updates = self._update_budget_state(state)
+        budget_updates = await self._update_budget_state(state)
         await self._bus.publish(Event(
             event_type=EventType.STATE_SNAPSHOT,
             session_id=state.get("session_id", ""),
@@ -717,9 +858,12 @@ class InstituteGraphBuilder:
         Generate an institute-wide briefing for all agents.
 
         Summarizes: current best hypotheses, top contradictions,
-        cluster positions, and recommended focus areas. This briefing
-        is injected into every squid's prompt in the next iteration
-        so they know the institutional context.
+        cluster positions, recommended focus areas, and convergence metrics.
+        This briefing is injected into every squid's prompt in the next
+        iteration so they know the institutional context.
+
+        Hypotheses are sorted by evidence coverage (least-evidenced first)
+        so the briefing naturally directs attention to gaps.
         """
         # Gather top hypotheses
         session_id = state.get("session_id", "")
@@ -727,10 +871,23 @@ class InstituteGraphBuilder:
             status="active",
             session_id=session_id,
         )
+
+        # Sort by evidence coverage — least-evidenced first
+        hyp_with_coverage = []
+        for h in hypotheses:
+            ctx = await self._queries.get_hypothesis_context(h["id"])
+            finding_count = len(ctx.get("findings", []))
+            exp_count = len(ctx.get("experiments", []))
+            hyp_with_coverage.append((h, finding_count, exp_count))
+
+        # Sort: least-evidenced hypotheses first (coverage gaps bubble up)
+        hyp_with_coverage.sort(key=lambda x: (x[1], x[2]))
+
         top_hyp = "\n".join(
             f"- (confidence: {h.get('confidence', '?')}, "
-            f"by: {h.get('created_by', '?')}): {h.get('text', '')[:150]}"
-            for h in hypotheses[: self._config.briefing_top_hypotheses_limit]
+            f"by: {h.get('created_by', '?')}, "
+            f"findings: {fc}, experiments: {ec}): {h.get('text', '')[:150]}"
+            for h, fc, ec in hyp_with_coverage[: self._config.briefing_top_hypotheses_limit]
         ) or "None yet."
 
         # Contradictions
@@ -769,6 +926,21 @@ class InstituteGraphBuilder:
             for m in all_metrics
         ) or "No performance data yet."
 
+        # Include convergence metrics in briefing
+        convergence_metrics = state.get("convergence_metrics", {})
+        convergence_text = ""
+        if convergence_metrics:
+            convergence_text = (
+                f"\n\n=== CONVERGENCE ===\n"
+                f"Score: {convergence_metrics.get('convergence_score', 0):.2f} "
+                f"(threshold: {self._config.convergence_threshold})\n"
+                f"High-confidence: {convergence_metrics.get('high_confidence_count', 0)}"
+                f"/{convergence_metrics.get('total_hypotheses', 0)}\n"
+                f"Evidenced: {convergence_metrics.get('evidence_covered_count', 0)}"
+                f"/{convergence_metrics.get('total_hypotheses', 0)}\n"
+                f"Contradicted: {convergence_metrics.get('contradicted_count', 0)}"
+            )
+
         prompt = ITERATION_BRIEFING_PROMPT.format(
             research_question=state.get("research_question", ""),
             iteration=state.get("iteration", 0),
@@ -777,7 +949,7 @@ class InstituteGraphBuilder:
             ),
             top_hypotheses=top_hyp,
             contradictions=contra_text,
-            cluster_summary=cluster_text,
+            cluster_summary=cluster_text + convergence_text,
             agent_performance=perf_text,
         )
 
@@ -789,7 +961,7 @@ class InstituteGraphBuilder:
             max_tokens=self._config.max_tokens_briefing,
         )
 
-        budget_updates = self._update_budget_state(state)
+        budget_updates = await self._update_budget_state(state)
 
         return {
             "iteration_summary": briefing,

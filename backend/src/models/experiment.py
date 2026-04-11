@@ -150,3 +150,27 @@ class ExperimentResult(BaseArtifact):
         )
         props.pop("artifacts", None)
         return props
+
+
+class FindingInterpretation(BaseModel):
+    """Structured output from experiment result interpretation.
+
+    Produced by the LLM when auto-classifying what an experiment
+    result means for the hypothesis it tested. This feeds into
+    Finding creation and confidence propagation.
+    """
+
+    conclusion_type: Literal["supports", "refutes", "inconclusive", "partial"] = Field(
+        ...,
+        description="Whether the result supports, refutes, or is inconclusive about the hypothesis.",
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="How confident you are in this conclusion (0.0 = uncertain, 1.0 = definitive).",
+    )
+    text: str = Field(
+        ...,
+        description="Clear explanation of what the experiment result means for the hypothesis.",
+    )

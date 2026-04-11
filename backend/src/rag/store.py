@@ -89,6 +89,8 @@ class VectorStore:
         content = self._sanitize_text(content)
         if embedding is None:
             embeddings = await self._llm.embed([content])
+            if not embeddings or not embeddings[0]:
+                raise ValueError("No embedding data received from LLM client.")
             embedding = embeddings[0]
 
         embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"

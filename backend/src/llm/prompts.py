@@ -424,3 +424,30 @@ SYNTHESIZER_REPORT = """Synthesize the research findings.
 {agent_contributions}
 
 Produce a comprehensive research report in markdown format."""
+
+# ── Experiment Interpretation ────────────────────────────────────────
+
+EXPERIMENT_INTERPRETATION_PROMPT = """You are interpreting the result of a sandboxed experiment.
+
+## Hypothesis Being Tested
+{hypothesis_text}
+
+## Expected Outcome
+{expected_outcome}
+
+## Actual Result
+Exit code: {exit_code}
+Stdout: {actual_stdout}
+Stderr: {actual_stderr}
+
+## Your Task
+Determine whether this result supports, refutes, partially supports, or is
+inconclusive about the hypothesis. Provide a confidence score (0.0-1.0) for
+your determination and a clear explanation.
+
+Consider:
+- Exit code 0 doesn't automatically mean "supports" — the output must match expectations
+- A crash (non-zero exit) doesn't automatically mean "refutes" — it might mean the experiment was poorly designed
+- Look for quantitative signals in stdout that directly address the expected outcome
+- "inconclusive" is valid when the experiment ran but produced ambiguous results
+- "partial" means the result supports some aspects of the hypothesis but not others"""

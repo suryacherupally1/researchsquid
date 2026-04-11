@@ -194,24 +194,31 @@ class RAGRetriever:
         query: str,
         top_k: int = 20,
         session_id: str | None = None,
+        graph_queries: Any | None = None,
     ) -> dict[str, list[dict]]:
         """
         Build a comprehensive context package for an agent.
 
-        Retrieves relevant work from ALL agents (not just the querying agent),
-        grouped by type. This is what an agent reads before it starts reasoning.
+        Combines graph traversal with vector similarity:
+        1. Semantic search across all artifact types (including experiment_result)
+        2. Boost agent's own work (sorted first within each type)
+        3. Graph traversal: fetch experiment results + findings linked to
+           the agent's hypotheses via TESTED_BY → PRODUCED chains
 
         Returns:
             Dict keyed by artifact type, each containing a list of relevant artifacts.
         """
         all_results = await self.retrieve_for_inquiry(
             query,
-            include_types=["source_chunk", "note", "hypothesis", "assumption", "finding"],
+            include_types=[
+                "source_chunk", "note", "hypothesis",
+                "assumption", "finding", "experiment_result",
+            ],
             top_k=top_k,
             session_id=session_id,
         )
 
-        # Group by type
+        # Group by type, boosting agent's own artifacts to the front
         grouped: dict[str, list[dict]] = {}
         for r in all_results:
             atype = r.get("artifact_type", "unknown")
@@ -219,4 +226,56 @@ class RAGRetriever:
                 grouped[atype] = []
             grouped[atype].append(r)
 
+        # Boost agent's own work — sort own artifacts first
+        for atype in grouped:
+            grouped[atype].sort(
+                key=lambda r: (0 if r.get("created_by") == agent_id else 1),
+            )
+
+        # Graph traversal — fetch experiment results for agent's hypotheses
+        if graph_queries:
+            try:
+                agent_hyps = await graph_queries.get_all_hypotheses(
+                    created_by=agent_id, session_id=session_id
+                )
+                graph_results: list[dict] = []
+                for h in agent_hyps[:10]:  # Cap at 10 hypotheses
+                    hyp_context = await graph_queries.get_hypothesis_context(h["id"])
+                    # Experiments + results from graph traversal
+                    for exp_entry in hyp_context.get("experiments", []):
+                        result = exp_entry.get("result")
+                        if result:
+                            graph_results.append({
+                                **result,
+                                "artifact_type": "experiment_result",
+                                "score": 1.0,  # Graph results are exact matches
+                                "source": "graph_traversal",
+                            })
+                    # Findings from graph traversal
+                    for f in hyp_context.get("findings", []):
+                        graph_results.append({
+                            **f,
+                            "artifact_type": "finding",
+                            "score": 1.0,
+                            "source": "graph_traversal",
+                        })
+
+                # Deduplicate graph results against vector results
+                existing_ids = {
+                    r.get("artifact_id") or r.get("id")
+                    for rlist in grouped.values()
+                    for r in rlist
+                }
+                for gr in graph_results:
+                    gr_id = gr.get("artifact_id") or gr.get("id")
+                    if gr_id and gr_id not in existing_ids:
+                        atype = gr["artifact_type"]
+                        if atype not in grouped:
+                            grouped[atype] = []
+                        grouped[atype].insert(0, gr)  # Prepend graph results
+                        existing_ids.add(gr_id)
+            except Exception:
+                pass  # Graceful degradation — graph enrichment is optional
+
         return grouped
+
