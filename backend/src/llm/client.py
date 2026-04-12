@@ -168,6 +168,7 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         usage_accumulator: dict[str, Any] | None = None,
+        model_override: str | None = None,
     ) -> str:
         """
         Send a prompt and return the text response.
@@ -177,6 +178,7 @@ class LLMClient:
             system: Optional system message for role/behavior guidance.
             temperature: Sampling temperature (0.0 = deterministic).
             max_tokens: Maximum response length.
+            model_override: Use a specific model instead of the configured default.
 
         Returns:
             The assistant's text response.
@@ -186,8 +188,9 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        model = model_override or self._model
         response = await self._client.chat.completions.create(
-            model=self._model,
+            model=model,
             messages=messages,
             temperature=(
                 self._config.temperature_default_text

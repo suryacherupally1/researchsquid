@@ -60,6 +60,11 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("POWERFUL_MODEL", "SQUID_LLM_MODEL_POWERFUL"),
     )
+    judge_model: str = Field(
+        default="",
+        description="Model for LLM-as-judge evaluation. Empty = use openai_model.",
+        validation_alias=AliasChoices("JUDGE_MODEL"),
+    )
 
     # LLM temperatures
     temperature_director: float = 0.5
